@@ -1,119 +1,77 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI象棋对战系统</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>弈台 · AI 中国象棋</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css', v='opensource-1') }}">
 </head>
 <body>
-    <div class="container">
-
-        <div class="main-content">
-            <!-- 左侧控制面板 -->
-            <div class="control-panel">
-                <div class="panel-section">
-                    <h3>红方配置</h3>
-                    <div class="player-config">
-                        <select id="red-model" class="model-select">
-                            <option value="deepseek-ai/DeepSeek-V3">DeepSeek-V3</option>
-                        </select>
-                        <input type="text" id="red-api-key" class="api-input" placeholder="输入硅基流动 API Key">
-                        <input type="hidden" id="red-display-name" value="DeepSeek-V3">
-                        <input type="hidden" id="red-base-url" value="https://api.siliconflow.cn/v1">
-                    </div>
-                </div>
-
-                <div class="panel-section">
-                    <h3>黑方配置</h3>
-                    <div class="player-config">
-                        <select id="black-model" class="model-select">
-                            <option value="gemini-2.5-flash">Gemini-2.5-Flash</option>
-                        </select>
-                        <input type="text" id="black-api-key" class="api-input" placeholder="输入Google API Key">
-                        <input type="hidden" id="black-display-name" value="Gemini-2.5-Flash">
-                        <input type="hidden" id="black-base-url" value="https://generativelanguage.googleapis.com/v1beta">
-                    </div>
-                </div>
-
-                <div class="panel-section">
-                    <h3>控制面板</h3>
-                    <div class="control-buttons">
-                        <button id="start-battle" class="btn btn-primary">开始对战</button>
-                        <button id="stop-battle" class="btn btn-secondary" disabled>停止对战</button>
-                        <button id="reset-battle" class="btn btn-warning">重置对战</button>
-                    </div>
-                    <div class="status-info">
-                        <div id="connection-status">连接状态: 未连接</div>
-                    </div>
-                </div>
-
-            </div>
-
-            <!-- 中间棋盘区域 -->
-            <div class="chess-board-section">
-                <div class="current-player-info">
-                    <div id="current-player-text">当前轮到红方执棋</div>
-                </div>
-                <div class="board-container">
-                    <canvas id="chess-board" width="600" height="650"></canvas>
-                </div>
-            </div>
-
-            <!-- 右侧信息面板 -->
-            <div class="info-panel">
-                <div class="panel-section">
-                    <h3>对战统计</h3>
-                    <div class="stats">
-                        <div class="stat-item">
-                            <span class="stat-label">当前回合:</span>
-                            <span class="stat-value" id="current-round">0</span>
-                        </div>
-                        <div class="stat-item">
-                            <span class="stat-label">总步数:</span>
-                            <span class="stat-value" id="total-moves">0</span>
-                        </div>
-                        <div class="stat-item">
-                            <span class="stat-label">对战时长:</span>
-                            <span class="stat-value" id="battle-duration">00:00</span>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="panel-section">
-                    <h3>黑方思考</h3>
-                    <div id="black-thinking-process" class="thinking-content">
-                        <p>等待黑方开始思考...</p>
-                    </div>
-                </div>
-
-                <div class="panel-section">
-                    <h3>红方思考</h3>
-                    <div id="red-thinking-process" class="thinking-content">
-                        <p>等待红方开始思考...</p>
-                    </div>
-                </div>
-
-                <div class="panel-section">
-                    <h3>对战信息</h3>
-                    <div id="battle-log" class="battle-log">
-                        <p>等待对战开始...</p>
-                    </div>
-                </div>
-            </div>
-        </div>
-
+<header class="app-header"><div><strong>弈台 <span>AI 中国象棋</span></strong><p>配置你的模型，让它们在棋盘上见真章。</p></div><a href="#api-manager">API 配置管理 ↓</a></header>
+<section class="battle-toolbar" aria-label="对战控制">
+ <div class="control-buttons">
+  <button id="start-battle" class="btn btn-primary">开始对战</button>
+  <button id="stop-battle" class="btn btn-secondary" disabled>停止</button>
+  <button id="resume-battle" class="btn btn-resume" style="display:none">继续对战</button>
+  <button id="reset-battle" class="btn btn-warning">重置</button>
+ </div>
+ <div class="toolbar-status" aria-live="polite"><div id="game-status">游戏状态: 等待开始</div><div id="connection-status">连接状态: 未连接</div></div>
+ <details id="network-details" class="network-details"><summary>状态详情 / 长错误（点击展开）</summary><div id="network-status" class="network-status"></div></details>
+</section>
+<main class="container">
+ <div class="main-content">
+  <aside class="control-panel">
+   <details class="panel" open><summary>对局配置 <small>仅影响下一局</small></summary>
+    <div class="panel-body"><p class="hint">两边都能使用任意已存配置（含 Claude 官方接口和本机 Ollama）。对局中锁定；停止后可改。云端 API 刷新后请重新输入 key；本机地址可留空。后端仍在运行的对局可直接继续。</p>
+     {% for side, label in [('red','红'), ('black','黑')] %}
+     <fieldset class="player-config player-{{ side }}"><legend>{{ label }}方</legend>
+      <label for="{{ side }}-model">API / 模型配置</label><select id="{{ side }}-model" class="model-select" data-setup></select>
+      <div id="{{ side }}-endpoint" class="endpoint-summary"></div>
+      <label for="{{ side }}-thinking-mode">思考模式</label><select id="{{ side }}-thinking-mode" data-setup></select>
+      <label for="{{ side }}-api-key">API key <small>仅此页面内存；本地模型如 Ollama 可留空</small></label>
+      <div class="key-row"><input type="password" id="{{ side }}-api-key" class="api-input" placeholder="请输入 key（不保存；本地模型如 Ollama 可留空）" autocomplete="off" autocapitalize="none" spellcheck="false" data-setup><button type="button" class="btn key-toggle" data-target="{{ side }}-api-key" aria-label="显示{{ label }}方密钥" aria-pressed="false" data-setup>显示</button></div>
+      <button type="button" class="btn test-side" data-side="{{ side }}" data-setup>测试连接 · 可能计费</button><div id="{{ side }}-test-status" class="test-status" role="status"></div>
+     </fieldset>
+     {% endfor %}
+     <a href="#api-manager">＋ 添加 / 编辑 API 配置</a><p id="config-lock-note" class="hint"></p>
     </div>
-
-    <!-- 加载遮罩 -->
-    <div id="loading-overlay" class="loading-overlay" style="display: none;">
-        <div class="loading-content">
-            <div class="spinner"></div>
-            <p>正在启动AI对战...</p>
-        </div>
+   </details>
+  </aside>
+  <section class="chess-board-section panel" aria-label="棋盘">
+   <div class="current-player-info"><div id="current-player-text">当前轮到红方执棋</div><div id="active-match" class="hint">等待模型就位</div></div>
+   <div class="board-container"><canvas id="chess-board" width="600" height="660" aria-label="中国象棋棋盘"></canvas></div>
+   <div class="stats"><span>第 <b id="current-round">0</b> 回合</span><span>总步数 <b id="total-moves">0</b></span><span>用时 <b id="battle-duration">00:00</b></span></div>
+   <p class="board-note">将死、困毙判负 · 默认 300 步判和 · 每步自动保存到 games/</p>
+  </section>
+  <aside class="info-panel">
+   <details class="panel" open><summary>对战日志 <small>可展开长错误</small></summary><div class="panel-body"><button id="expand-log" class="btn">展开全部日志</button><div id="battle-log" class="battle-log" tabindex="0"><p>等待对战开始…</p></div></div></details>
+   <details class="panel"><summary>红方 · 模型思考与分析</summary><div id="red-thinking-process" class="thinking-content" tabindex="0">等待红方开始思考…</div></details>
+   <details class="panel"><summary>黑方 · 模型思考与分析</summary><div id="black-thinking-process" class="thinking-content" tabindex="0">等待黑方开始思考…</div></details>
+  </aside>
+ </div>
+ <section id="api-manager" class="panel api-manager">
+  <h2>API 配置管理</h2><p class="hint">配置保存在此浏览器的本地存储，<strong>不包含 key</strong>（key 只放在当前页面内存，不写磁盘）。支持 DeepSeek、Kimi、Gemini 兼容入口、Anthropic Claude 官方 Messages API，以及各类 OpenAI 兼容中转站和本机 Ollama / LM Studio。多填的 /chat/completions 或 /messages 会自动去掉。预设名称仅供参考，请以服务商给出的准确模型 ID 为准。</p>
+  <div class="manager-grid">
+   <div><label for="profile-list">已保存的配置</label><select id="profile-list" size="7" data-setup></select><div class="button-row"><button id="new-profile" class="btn" data-setup>＋ 新增</button><button id="delete-profile" class="btn danger" data-setup>删除所选</button></div></div>
+   <form id="profile-form" autocomplete="off">
+    <div class="form-grid">
+     <label>显示名称<input id="profile-name" maxlength="100" required data-setup></label>
+     <label>Provider 模板<select id="profile-provider" data-setup><option value="custom">OpenAI 兼容 · 自定义（含 Ollama）</option><option value="deepseek">DeepSeek</option><option value="kimi">Kimi / Moonshot</option><option value="gemini">Gemini OpenAI 兼容</option><option value="anthropic">Claude · Anthropic 原生</option></select></label>
+     <label class="wide">base_url（根地址；多填的 /chat/completions 或 /messages 会自动去掉）<input id="profile-url" type="url" placeholder="https://你的服务/v1 或 http://127.0.0.1:11434/v1" required maxlength="1000" data-setup></label>
+     <label class="wide">model（精确名称）<input id="profile-model" required maxlength="200" placeholder="填服务商提供的模型 ID" data-setup></label>
+     <label>最大输出 token<input id="profile-max" type="number" min="64" max="65536" step="1" required data-setup></label>
+     <label>读取超时 / 秒<input id="profile-timeout" type="number" min="2" max="600" step="1" required data-setup></label>
+     <label>默认思考模式<select id="profile-thinking" data-setup></select></label>
     </div>
-
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <script src="{{ url_for('static', filename='js/chess.js') }}"></script>
-</body>
-</html>
+    <p id="provider-help" class="hint"></p>
+    <div class="button-row"><button type="submit" class="btn btn-primary" data-setup>保存配置（不含 key）</button><button type="button" id="assign-red" class="btn" data-setup>保存并选给红方</button><button type="button" id="assign-black" class="btn" data-setup>保存并选给黑方</button></div>
+    <div id="profile-status" class="test-status" role="status"></div>
+   </form>
+  </div>
+ </section>
+ <footer>请勿公开密钥。仅在本机使用；HTTP 会明文发送 key，请优先使用 HTTPS。连接测试也可能计费，配置保存本身不会调用 API。</footer>
+</main>
+<div id="loading-overlay" role="status" style="display:none">正在启动对局…</div>
+<script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/profiles.js', v='opensource-1') }}"></script>
+<script src="{{ url_for('static', filename='js/chess.js', v='opensource-1') }}"></script>
+</body></html>

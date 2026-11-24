@@ -101,42 +101,45 @@ class ChessBattle:
         self.battle_log.append(log_entry)
     
     def get_battle_result(self) -> Dict:
-        """获取对战结果"""
-        if not self.game.is_game_over() and self.status != "error":
+        """获取对战结果（将死 / 困毙 / 吃将 / 步数上限判和）。"""
+        st = self.game.get_game_status()
+        if not st["over"]:
             return {
                 'status': 'ongoing',
                 'message': '对局进行中',
-                'winner': None
+                'winner': None,
+                'winner_color': None,
+                'reason': 'ongoing',
             }
-        
-        if self.status == "error":
-            return {
-                'status': 'error',
-                'message': '对局因错误结束',
-                'winner': None
-            }
-        
-        game_result = self.game.get_game_result()
-        
-        if "白方获胜" in game_result:
+        color = st["winner"]
+        if color == "red":
             winner = self.red_player.display_name
-            message = f"{winner} 获胜（白方）"
-        elif "黑方获胜" in game_result:
+            game_result = "红方获胜"
+        elif color == "black":
             winner = self.black_player.display_name
-            message = f"{winner} 获胜（黑方）"
+            game_result = "黑方获胜"
         else:
             winner = None
-            message = "平局"
-        
+            game_result = "平局"
+        reason_cn = {
+            'checkmate': '将死',
+            'stalemate': '困毙',
+            'king_captured': '吃将',
+            'move_limit': '步数上限判和',
+        }.get(st["reason"], st["reason"])
+        message = st["message"] + (f"（{winner}）" if winner else "")
         return {
             'status': 'finished',
             'message': message,
             'winner': winner,
+            'winner_color': color,
+            'reason': st["reason"],
+            'reason_cn': reason_cn,
             'game_result': game_result,
             'total_moves': len(self.game.move_history),
             'duration': time.time() - self.start_time
         }
-    
+
     def get_current_status(self) -> Dict:
         """获取当前对战状态"""
         return {

@@ -1,15 +1,41 @@
-import openai
 import requests
 import json
 import time
+import os
 import re
+import threading
 from typing import Dict, Optional, List, Generator
-from google import genai
+from .api_config import (
+    validate_config, build_payload, infer_provider, clean_text,
+    request_headers, endpoint_url, run_compat_request, is_json_content_type,
+    parse_chat_completion_json, parse_anthropic_message, parse_anthropic_sse_event,
+)
+from .network_errors import (
+    is_network_error,
+    friendly_network_message,
+    parse_retry_after,
+    network_error_payload,
+    NETWORK_HTTP_STATUS,
+)
 
 class LLMPlayer:
     """大语言模型中国象棋玩家类"""
     
-    def __init__(self, model_name: str, api_key: str, base_url: Optional[str] = None, display_name: str = "", socketio=None):
+    def __init__(self, model_name: str, api_key: str, base_url: Optional[str] = None, display_name: str = "", socketio=None, thinking_mode: str = "disabled", provider=None, max_output=None, timeout=None):
+        actual_provider = provider or infer_provider(model_name, base_url)
+        if actual_provider == 'kimi' and thinking_mode == 'disabled' and provider is None:
+            thinking_mode = 'low'  # 旧调用兼容
+        raw = dict(model_name=model_name, api_key=api_key, base_url=base_url,
+                   display_name=display_name, provider=actual_provider, thinking_mode=thinking_mode)
+        if max_output is not None:
+            raw['max_output'] = max_output
+        if timeout is not None:
+            raw['timeout'] = timeout
+        self.api_config = validate_config(raw)
+        self.provider = actual_provider
+        self.timeout = self.api_config['timeout']
+        self.max_output = self.api_config['max_output']
+        base_url = self.api_config['base_url']
         self.model_name = model_name
         self.api_key = api_key
         self.base_url = base_url
@@ -17,14 +43,54 @@ class LLMPlayer:
         self.move_count = 0
         self.total_thinking_time = 0
         self.socketio = socketio
+        # DeepSeek 官方参数：thinking.type = enabled/disabled，reasoning_effort = none/low/high/max
+        self.thinking_mode = (thinking_mode or "disabled").strip().lower()
+        # 可取消调用：对战循环在工作线程里调用 get_move，停止/立即重试时把令牌作废，
+        # 旧请求的流式输出就不会再推到页面，并会尽快关闭连接。
+        self._tls = threading.local()
+        self._active_token = None
+        self._active_response = None
+        self._call_lock = threading.Lock()
+
+    # ---- 可取消调用 ----
+    def begin_call(self, token):
+        """在工作线程里调用：登记本次调用的令牌。"""
+        self._tls.token = token
+        with self._call_lock:
+            self._active_token = token
+
+    def cancel_call(self, token=None):
+        """作废当前（或指定）调用，并尽量关闭正在读取的 HTTP 流。"""
+        with self._call_lock:
+            if token is not None and self._active_token is not token:
+                return
+            self._active_token = None
+            resp = self._active_response
+            self._active_response = None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def _call_active(self) -> bool:
+        token = getattr(self._tls, "token", None)
+        if token is None:
+            return True  # 直接同步调用（测试/旧代码），永不取消
+        return token is self._active_token
+
+    def _emit(self, event, payload):
+        if self.socketio and self._call_active():
+            self.socketio.emit(event, payload)
     
-    def get_move(self, board_state: str, move_history: List[dict], legal_moves: List[str] = None) -> Optional[Dict]:
+    def get_move(self, board_state: str, move_history: List[dict], legal_moves: List[str] = None, retry_hint: str = None, strict_output: bool = False, in_check: bool = False, checkers: List[str] = None) -> Optional[Dict]:
         """获取模型的下一步棋（支持流式输出）
         
         Args:
             board_state: 当前棋盘状态
             move_history: 历史棋步列表
             legal_moves: 当前所有合法棋步列表
+            retry_hint: 上次非法走法或解析失败时的错误说明，供重试时反馈给模型
             
         Returns:
             Dict: 包含棋步和思考过程的字典
@@ -33,569 +99,606 @@ class LLMPlayer:
         
         try:
             # 构建提示词
-            prompt = self.build_chess_prompt(board_state, move_history, legal_moves)
+            prompt = self.build_chess_prompt(board_state, move_history, legal_moves, retry_hint=retry_hint, strict_output=strict_output, in_check=in_check, checkers=checkers)
             
             # 确定玩家颜色
             player_color = "red" if len(move_history) % 2 == 0 else "black"
             
             print(f"开始获取 {self.display_name} 的棋步...")
             
-            # 调用相应的流式API
-            response = ""
-            if "deepseek" in self.model_name.lower():
-                response = self.call_deepseek_stream(prompt, player_color)
-            elif "gemini" in self.model_name.lower():
-                response = self.call_gemini_stream(prompt, player_color)
-            else:
-                # 回退到非流式API
-                if "openai" in self.model_name.lower() or "gpt" in self.model_name.lower():
-                    response = self.call_openai_api(prompt)
-                elif "claude" in self.model_name.lower():
-                    response = self.call_claude_api(prompt)
-                else:
-                    response = self.call_generic_api(prompt)
-            
-            print(f"API调用完成，响应长度: {len(response) if response else 0}")
-            
-            # 检查响应是否为空
-            if not response or response.strip() == "":
-                print(f"{self.display_name} API返回空响应")
-                return None
-            
-            # 解析响应
-            move_info = self.parse_response(response)
-            
-            # 记录思考时间
+            # OpenAI 兼容与 Anthropic 原生都走统一请求入口（含自动兼容重试）。
+            api_result = self._call_openai_compatible_stream(prompt, player_color)
+
+            if isinstance(api_result, str):
+                api_result = {'content': api_result, 'reasoning': ''}
+
+            if api_result.get('error'):
+                err = clean_text(api_result['error'], self.api_key)
+                print(f"{self.display_name} API错误: {err}")
+                if api_result.get('detail'):
+                    print(f"{self.display_name} API错误详情: {clean_text(api_result.get('detail'), self.api_key)}")
+                return {
+                    'move': None,
+                    'error': err,
+                    'detail': clean_text(api_result.get('detail'), self.api_key) or err,
+                    'fatal': api_result.get('fatal', False),
+                    'error_type': api_result.get('error_type') or ('network' if is_network_error(error_text=err) else 'api'),
+                    'retry_after': api_result.get('retry_after'),
+                    'raw_response': clean_text(api_result.get('raw_response'), self.api_key),
+                    'player': self.display_name,
+                }
+
+            content = clean_text(api_result.get('content'), self.api_key)
+            reasoning = clean_text(api_result.get('reasoning'), self.api_key)
+            print(f"API调用完成，content长度: {len(content)}，reasoning长度: {len(reasoning)}，finish_reason={api_result.get('finish_reason')}")
+            if not content.strip():
+                reason = "模型正文content为空"
+                if api_result.get('finish_reason') == 'length':
+                    reason += "（finish_reason=length，可能在思考阶段就用尽了token上限）"
+                elif reasoning.strip():
+                    reason += "（只有reasoning_content，没有最终回答）"
+                print(f"{self.display_name} {reason}")
+                return {
+                    'move': None,
+                    'error': reason,
+                    'error_type': 'parse',
+                    'thinking': reasoning,
+                    'raw_response': content,
+                    'player': self.display_name,
+                }
+
+            # 只根据最终 content 提取走法，不用推理过程里出现的坐标
+            move_info = self.parse_response(content, legal_moves=legal_moves)
+
             thinking_time = time.time() - start_time
             self.total_thinking_time += thinking_time
             self.move_count += 1
-            
+
             if move_info:
                 move_info['thinking_time'] = thinking_time
                 move_info['player'] = self.display_name
-                print(f"{self.display_name} 成功获取棋步: {move_info.get('move')}")
+                if reasoning:
+                    move_info['thinking'] = (reasoning + "\n" + (move_info.get('thinking') or '')).strip()
+                print(f"{self.display_name} 成功获取棋步: {move_info.get('move')}；是否在合法列表中: {move_info.get('in_legal_list')}")
                 return move_info
-            else:
-                print(f"{self.display_name} 无法解析出有效棋步")
-                return None
+
+            print(f"{self.display_name} 无法从content中解析出棋步。失败原因：未匹配到坐标格式或合法走法")
+            return {
+                'move': None,
+                'error': '无法从模型回复中解析出棋步（正文已收到，但没有可识别的坐标）',
+                'error_type': 'parse',
+                'thinking': reasoning,
+                'raw_response': content,
+                'player': self.display_name,
+            }
             
         except Exception as e:
-            print(f"获取{self.display_name}棋步时出错: {e}")
+            print(f"获取{self.display_name}棋步时出错: {clean_text(e, self.api_key)}")
             import traceback
-            traceback.print_exc()
-            return None
+            if is_network_error(exc=e, error_text=clean_text(e, self.api_key)):
+                payload = network_error_payload(self.base_url, f"获取棋步时网络错误: {clean_text(e, self.api_key)}", exc=e)
+                payload["move"] = None
+                payload["player"] = self.display_name
+                return payload
+            return {
+                'move': None,
+                'error': f'获取棋步时出错: {clean_text(e, self.api_key)}',
+                'error_type': 'api',
+                'fatal': False,
+                'player': self.display_name,
+            }
     
+    def _live_config(self):
+        """用实例上当前的 base_url / api_key（测试或恢复对局可能已改写）。"""
+        cfg = dict(self.api_config)
+        cfg['base_url'] = self.base_url
+        cfg['api_key'] = self.api_key
+        return cfg
+
+    def _chat_completions_url(self) -> str:
+        return endpoint_url(self._live_config())
+
     def call_deepseek_stream(self, prompt: str, player_color: str) -> str:
-        """调用DeepSeek流式API - 使用requests直接调用避免OpenAI客户端问题"""
-        try:
-            print(f"开始调用DeepSeek流式API，玩家颜色: {player_color}")
-            
-            # 使用 requests 直接调用流式API，避免 OpenAI 客户端的兼容性问题
-            import requests
-            import json
-            
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            data = {
-                "model": self.model_name,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "stream": True
-            }
-            
-            print(f"发送请求到: https://api.siliconflow.cn/v1/chat/completions")
-            
-            response = requests.post(
-                "https://api.siliconflow.cn/v1/chat/completions",
-                headers=headers,
-                json=data,
-                stream=True,
-                timeout=90  # 增加超时时间到90秒
-            )
-            
-            if response.status_code != 200:
-                print(f"API请求失败，状态码: {response.status_code}")
-                print(f"响应内容: {response.text}")
-                return ""
-            
-            print("开始接收流式响应...")
-            
-            full_content = ""
-            chunk_count = 0
-            buffer = ""  # 缓冲区，用于积累内容
-            buffer_size = 5  # 每5个字符发送一次，更流畅的显示
-            
-            # 处理流式响应
-            for line in response.iter_lines():
-                if line:
-                    chunk_count += 1
-                    line_str = line.decode('utf-8')
-                    
-                    # 跳过非数据行
-                    if not line_str.startswith('data: '):
-                        continue
-                    
-                    # 移除 "data: " 前缀
-                    json_str = line_str[6:]
-                    
-                    # 跳过结束标记
-                    if json_str.strip() == '[DONE]':
-                        break
-                    
-                    try:
-                        # 解析JSON数据
-                        chunk_data = json.loads(json_str)
-                        
-                        if 'choices' in chunk_data and chunk_data['choices']:
-                            delta = chunk_data['choices'][0].get('delta', {})
-                            
-                            # 处理普通内容
-                            if 'content' in delta and delta['content']:
-                                content = delta['content']
-                                full_content += content
-                                buffer += content
-                            
-                            # 处理推理内容（DeepSeek-R1特有）
-                            if 'reasoning_content' in delta and delta['reasoning_content']:
-                                reasoning_content = delta['reasoning_content']
-                                full_content += reasoning_content
-                                buffer += reasoning_content
-                            
-                            # 当缓冲区达到一定大小时发送
-                            if len(buffer) >= buffer_size:
-                                # print(f"发送缓冲内容 (长度{len(buffer)}): {repr(buffer[:50])}...")
-                                if self.socketio:
-                                    try:
-                                        # 使用Flask-SocketIO的正确方式发送事件
-                                        event_data = {
-                                            'player': player_color,
-                                            'content': buffer,
-                                            'is_complete': False
-                                        }
-                                        #print(f"准备发送事件数据: {event_data}")
-                                        
-                                        # 发送事件
-                                        self.socketio.emit('thinking_stream', event_data)
-                                        # print(f"成功发送thinking_stream事件到{player_color}")
-                                        
-                                        # 强制刷新Socket.IO
-                                        self.socketio.sleep(0.01)
-                                        
-                                    except Exception as e:
-                                        print(f"发送thinking_stream事件失败: {e}")
-                                        import traceback
-                                        traceback.print_exc()
-                                else:
-                                    print("警告: socketio实例为None")
-                                buffer = ""  # 清空缓冲区
-                    
-                    except json.JSONDecodeError as e:
-                        print(f"解析JSON失败: {e}, 原始数据: {json_str}")
-                        continue
-            
-            # 发送剩余的缓冲内容
-            if buffer:
-                print(f"发送最后的缓冲内容 (长度{len(buffer)}): {repr(buffer[:50])}...")
-                if self.socketio:
-                    try:
-                        self.socketio.emit('thinking_stream', {
-                            'player': player_color,
-                            'content': buffer,
-                            'is_complete': False
-                        })
-                        print(f"成功发送最后的thinking_stream事件到{player_color}")
-                    except Exception as e:
-                        print(f"发送最后的thinking_stream事件失败: {e}")
-                else:
-                    print("警告: socketio实例为None")
-            
-            print(f"流式响应完成，总块数: {chunk_count}, 总内容长度: {len(full_content)}")
-            
-            # 发送完成信号
-            if self.socketio:
-                try:
-                    print("发送流式完成信号")
-                    self.socketio.emit('thinking_stream', {
-                        'player': player_color,
-                        'content': '',
-                        'is_complete': True
-                    })
-                    print(f"成功发送完成信号到{player_color}")
-                except Exception as e:
-                    print(f"发送完成信号失败: {e}")
-            else:
-                print("警告: socketio实例为None，无法发送完成信号")
-            
-            return full_content
-                
-        except requests.exceptions.ReadTimeout as e:
-            print(f"DeepSeek API读取超时: {e}")
-            return ""
-        except requests.exceptions.ConnectionError as e:
-            print(f"DeepSeek API连接错误: {e}")
-            return ""
-        except requests.exceptions.RequestException as e:
-            print(f"DeepSeek API请求异常: {e}")
-            return ""
-        except Exception as e:
-            print(f"DeepSeek流式API调用失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return ""
-    
+        """调用 DeepSeek 流式 API（官方 OpenAI 兼容接口）"""
+        print(f"开始调用DeepSeek流式API，玩家颜色: {player_color}")
+        return self._call_openai_compatible_stream(prompt, player_color)
+
+    def call_kimi_stream(self, prompt: str, player_color: str) -> str:
+        """调用 Kimi（Moonshot）流式 API（官方 OpenAI 兼容接口）"""
+        print(f"开始调用Kimi流式API，玩家颜色: {player_color}")
+        return self._call_openai_compatible_stream(prompt, player_color)
+
     def call_gemini_stream(self, prompt: str, player_color: str) -> str:
-        """调用Gemini流式API"""
-        try:
-            from google import genai
-            
-            # 创建客户端（API密钥从环境变量获取）
-            client = genai.Client(api_key=self.api_key)
-            
-            # 构建完整的提示
-            full_prompt = f"你是一位专业的中国象棋大师，擅长分析局面和制定策略。\n\n{prompt}"
-            
-            # 生成内容
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=full_prompt
-            )
-            
-            # Gemini API目前不支持真正的流式输出，我们模拟流式效果
-            full_text = response.text
-            
-            # 按句子分割并逐步发送
-            sentences = re.split(r'([。！？\n])', full_text)
-            current_text = ""
-            
-            for i in range(0, len(sentences), 2):
-                if i < len(sentences):
-                    sentence = sentences[i]
-                    if i + 1 < len(sentences):
-                        sentence += sentences[i + 1]
-                    
-                    current_text += sentence
-                    
-                    if self.socketio:
-                        self.socketio.emit('thinking_stream', {
-                            'player': player_color,
-                            'content': sentence,
-                            'is_complete': False
-                        })
-                    
-                    # 短暂延迟模拟流式效果
-                    time.sleep(0.1)
-            
-            # 发送完成信号
-            if self.socketio:
-                self.socketio.emit('thinking_stream', {
-                    'player': player_color,
-                    'content': '',
-                    'is_complete': True
-                })
-            
-            return full_text
-            
-        except Exception as e:
-            print(f"Gemini流式API调用失败: {e}")
-            import traceback
-            traceback.print_exc()
+        """调用 Gemini 流式 API（Google OpenAI 兼容端点）"""
+        print(f"开始调用Gemini流式API（OpenAI兼容接口），玩家颜色: {player_color}")
+        system_prompt = "你是一位专业的中国象棋大师，擅长分析局面和制定策略。"
+        return self._call_openai_compatible_stream(prompt, player_color, system_prompt=system_prompt)
+
+    def _delta_text(self, value) -> str:
+        """从流式 delta 字段取出文本；兼容 None、字符串、以及多模态 content 数组。"""
+        if value is None:
             return ""
-    
-    def format_board_display(self, board_state: str) -> str:
-        """将棋盘状态转换为更直观的显示格式"""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    parts.append(item.get("text") or item.get("content") or "")
+            return "".join(parts)
+        return str(value)
+
+    def _extract_api_error_message(self, status_code: int, body: str):
+        body = clean_text(body, self.api_key)
+        message = body.strip()
         try:
-            # 将棋盘状态按行分割
-            lines = board_state.strip().split('\n')
-            if len(lines) != 10:
-                return board_state  # 如果格式不正确，返回原始状态
-            
-            # 添加列标识
-            display = "  a b c d e f g h i\n"
-            
-            for i, line in enumerate(lines):
-                # 添加行号和棋子，用空格分隔
-                row_display = f"{i} "
-                for j, char in enumerate(line):
-                    if j < len(line):
-                        row_display += char + " "
-                display += row_display.rstrip() + "\n"
-            
-            return display
-            
+            data = json.loads(body)
+            err = data.get("error", data)
+            if isinstance(err, dict):
+                message = err.get("message") or err.get("msg") or body.strip()
+            elif isinstance(err, str):
+                message = err
+        except Exception:
+            pass
+        if len(message) > 500:
+            message = message[:500] + "..."
+        fatal = status_code in (400, 401, 402, 403, 404, 405, 422) or "authentication" in message.lower() or "invalid api key" in message.lower() or "余额" in message or "quota" in message.lower()
+        return f"API {status_code}: {message}", fatal
+
+    def _http_error_result(self, status_code: int, body: str, retry_after=None) -> dict:
+        body = clean_text(body, self.api_key)
+        message, fatal = self._extract_api_error_message(status_code, body)
+        if status_code in NETWORK_HTTP_STATUS or is_network_error(status_code=status_code, error_text=message):
+            return network_error_payload(
+                self.base_url,
+                message,
+                status_code=status_code,
+                retry_after=retry_after,
+                raw_response=body,
+            )
+        error_type = "auth" if fatal else "api"
+        return {
+            "content": "",
+            "reasoning": "",
+            "error": message,
+            "detail": message,
+            "fatal": fatal,
+            "error_type": "config" if status_code in (400, 404, 405, 422) else error_type,
+            "retry_after": retry_after,
+            "raw_response": body,
+        }
+
+    def _exception_error_result(self, prefix: str, exc: Exception) -> dict:
+        text = clean_text(f"{prefix}: {exc}", self.api_key)
+        if is_network_error(exc=exc, error_text=text):
+            return network_error_payload(self.base_url, text, exc=exc)
+        return {
+            "content": "",
+            "reasoning": "",
+            "error": text,
+            "detail": text,
+            "fatal": False,
+            "error_type": "api",
+            "raw_response": "",
+        }
+
+    def _register_response(self, response):
+        with self._call_lock:
+            if self._call_active():
+                self._active_response = response
+
+    def _cancelled_result(self):
+        return {"content": "", "reasoning": "", "error": "调用已取消", "error_type": "cancelled", "fatal": False}
+
+    def _parse_success_response(self, response, player_color: str, streamed: bool) -> dict:
+        """解析 200 响应：JSON（非流式或网关直接返回 JSON）或 SSE 流。"""
+        content_type = response.headers.get("Content-Type") or ""
+        if (not streamed) or is_json_content_type(content_type):
+            try:
+                data = response.json()
+            except Exception as e:
+                return self._exception_error_result("返回不是合法 JSON", e)
+            try:
+                if self.provider == "anthropic":
+                    parsed = parse_anthropic_message(data)
+                else:
+                    parsed = parse_chat_completion_json(data)
+            except ValueError as e:
+                if "错误对象" in str(e):
+                    body = clean_text(response.text if hasattr(response, "text") else str(data), self.api_key)
+                    return self._http_error_result(response.status_code or 200, body)
+                return {
+                    "content": "", "reasoning": "", "error": "返回格式不兼容",
+                    "detail": clean_text(str(e), self.api_key), "fatal": False, "error_type": "api",
+                }
+            content = clean_text(parsed.get("content"), self.api_key)
+            reasoning = clean_text(parsed.get("reasoning"), self.api_key)
+            if self.socketio and (content or reasoning):
+                self._emit("thinking_stream", {
+                    "player": player_color,
+                    "content": clean_text((reasoning or "") + (content or ""), self.api_key),
+                    "is_complete": False,
+                })
+            if self.socketio:
+                self._emit("thinking_stream", {"player": player_color, "content": "", "is_complete": True})
+            return {
+                "content": content,
+                "reasoning": reasoning,
+                "finish_reason": parsed.get("finish_reason"),
+                "raw_response": content,
+            }
+        if self.provider == "anthropic":
+            return self._read_anthropic_sse(response, player_color)
+        return self._read_openai_sse(response, player_color)
+
+    def _emit_stream_buffer(self, player_color, buffer, piece, is_reasoning=False):
+        # is_reasoning unused; buffer already contains displayed text
+        buffer += piece
+        key_len = len(self.api_key or "")
+        if len(buffer) >= max(5, key_len * 2):
+            buffer = buffer.replace(self.api_key, "[已隐藏密钥]") if self.api_key else buffer
+            keep = max(0, key_len - 1)
+            cut = len(buffer) - keep
+            if cut > 0 and self.socketio:
+                self._emit("thinking_stream", {"player": player_color, "content": buffer[:cut], "is_complete": False})
+            buffer = buffer[cut:]
+        return buffer
+
+    def _finish_stream(self, player_color, full_content, full_reasoning, finish_reason, buffer, chunk_count):
+        if buffer and self.socketio:
+            self._emit("thinking_stream", {"player": player_color, "content": clean_text(buffer, self.api_key), "is_complete": False})
+        print(f"流式响应完成，总块数: {chunk_count}, content长度: {len(full_content)}, reasoning长度: {len(full_reasoning)}, finish_reason={finish_reason}")
+        if self.socketio:
+            try:
+                self._emit("thinking_stream", {"player": player_color, "content": "", "is_complete": True})
+            except Exception as e:
+                print(f"发送完成信号失败: {clean_text(e, self.api_key)}")
+        return {
+            "content": clean_text(full_content, self.api_key),
+            "reasoning": clean_text(full_reasoning, self.api_key),
+            "finish_reason": finish_reason,
+            "raw_response": clean_text(full_content, self.api_key),
+        }
+
+    def _iter_sse_data(self, response):
+        pending_json = ""
+        for line in response.iter_lines():
+            if not self._call_active():
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                yield None
+                return
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                continue
+            if line_str.startswith("event:") or line_str.startswith("id:") or line_str.startswith(":"):
+                continue
+            json_str = None
+            if line_str.startswith("data:"):
+                json_str = line_str[5:].lstrip()
+            elif line_str.startswith("{"):
+                json_str = line_str
+            else:
+                continue
+            if json_str.strip() == "[DONE]":
+                return
+            try:
+                chunk_data = json.loads(pending_json + json_str)
+                pending_json = ""
+            except json.JSONDecodeError:
+                pending_json += json_str
+                try:
+                    chunk_data = json.loads(pending_json)
+                    pending_json = ""
+                except json.JSONDecodeError:
+                    continue
+            yield chunk_data
+
+    def _read_openai_sse(self, response, player_color: str) -> dict:
+        print("开始接收流式响应...")
+        full_content = ""
+        full_reasoning = ""
+        chunk_count = 0
+        buffer = ""
+        finish_reason = None
+        for chunk_data in self._iter_sse_data(response):
+            if chunk_data is None:
+                return self._cancelled_result()
+            chunk_count += 1
+            if chunk_data.get("error"):
+                body = json.dumps(chunk_data, ensure_ascii=False)
+                status = chunk_data.get("status") or 200
+                result = self._http_error_result(status, body)
+                result["content"] = clean_text(full_content, self.api_key)
+                result["reasoning"] = clean_text(full_reasoning, self.api_key)
+                result["finish_reason"] = finish_reason
+                print(f"流式响应中包含error: {result.get('error')}")
+                return result
+            choices = chunk_data.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            if choice.get("finish_reason"):
+                finish_reason = choice.get("finish_reason")
+            delta = choice.get("delta") or {}
+            if not delta and choice.get("message"):
+                delta = choice.get("message") or {}
+            piece = self._delta_text(delta.get("content"))
+            if piece:
+                full_content += piece
+                buffer = self._emit_stream_buffer(player_color, buffer, piece)
+            reasoning_piece = (
+                self._delta_text(delta.get("reasoning_content"))
+                or self._delta_text(delta.get("reasoning"))
+                or self._delta_text(delta.get("thought"))
+            )
+            if reasoning_piece:
+                full_reasoning += reasoning_piece
+                buffer = self._emit_stream_buffer(player_color, buffer, reasoning_piece)
+        return self._finish_stream(player_color, full_content, full_reasoning, finish_reason, buffer, chunk_count)
+
+    def _read_anthropic_sse(self, response, player_color: str) -> dict:
+        print("开始接收 Anthropic 流式响应...")
+        full_content = ""
+        full_reasoning = ""
+        chunk_count = 0
+        buffer = ""
+        finish_reason = None
+        for chunk_data in self._iter_sse_data(response):
+            if chunk_data is None:
+                return self._cancelled_result()
+            chunk_count += 1
+            if chunk_data.get("type") == "error" or chunk_data.get("error") and chunk_data.get("type") not in ("message", "message_start", "message_delta", "message_stop", "content_block_start", "content_block_delta", "content_block_stop"):
+                body = json.dumps(chunk_data, ensure_ascii=False)
+                result = self._http_error_result(chunk_data.get("status") or 200, body)
+                result["content"] = clean_text(full_content, self.api_key)
+                result["reasoning"] = clean_text(full_reasoning, self.api_key)
+                result["finish_reason"] = finish_reason
+                print(f"Anthropic 流式响应中包含error: {result.get('error')}")
+                return result
+            piece, reasoning_piece, stop = parse_anthropic_sse_event(chunk_data)
+            if stop:
+                finish_reason = stop
+            if piece:
+                full_content += piece
+                buffer = self._emit_stream_buffer(player_color, buffer, piece)
+            if reasoning_piece:
+                full_reasoning += reasoning_piece
+                buffer = self._emit_stream_buffer(player_color, buffer, reasoning_piece)
+        return self._finish_stream(player_color, full_content, full_reasoning, finish_reason, buffer, chunk_count)
+
+    def _call_openai_compatible_stream(self, prompt: str, player_color: str, system_prompt: str = None) -> dict:
+        """调用当前 provider（OpenAI 兼容或 Anthropic 原生）。
+
+        返回 dict: content / reasoning / error / fatal / finish_reason / raw_response。
+        最终走法只应解析 content；reasoning / thinking 仅用于展示。
+        自动兼容 max_completion_tokens、非流式 JSON 与 stream 降级。
+        """
+        try:
+            url = endpoint_url(self._live_config())
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+
+            data = build_payload(self.api_config, messages, stream=True)
+            timeout = self.timeout
+
+            env_timeout = os.environ.get("AICHESS_API_TIMEOUT", "").strip()
+            if env_timeout:
+                try:
+                    timeout = float(env_timeout)
+                except ValueError:
+                    pass
+
+            print(f"发送请求到: {url}")
+            print(f"使用模型: {self.model_name}")
+            print(
+                "请求参数: "
+                f"provider={self.provider}, "
+                f"thinking={data.get('thinking')}, "
+                f"reasoning_effort={data.get('reasoning_effort')}, "
+                f"max_tokens={data.get('max_tokens')}, "
+                f"max_completion_tokens={data.get('max_completion_tokens')}, "
+                f"stream={data.get('stream')}, "
+                f"timeout={timeout}"
+            )
+
+            response, data, status = run_compat_request(
+                self._live_config(), data, timeout,
+                should_continue=self._call_active,
+                register_response=self._register_response,
+            )
+            if status == "cancelled":
+                return self._cancelled_result()
+            if status != "ok":
+                body = clean_text(getattr(response, "text", "") if response is not None else "", self.api_key)
+                code = getattr(response, "status_code", 0) or 0
+                print(f"API请求失败，状态码: {code}")
+                print(f"请求地址: {url}")
+                print(f"模型名称: {self.model_name}")
+                retry_after = parse_retry_after(response.headers.get("Retry-After") if response is not None else None)
+                result = self._http_error_result(code, body, retry_after=retry_after)
+                print(f"错误类型: {result.get('error_type')} 用户提示: {result.get('error')}")
+                return result
+
+            return self._parse_success_response(response, player_color, streamed=bool(data.get("stream", True)))
+
+        except requests.exceptions.ReadTimeout as e:
+            print(f"API读取超时: {clean_text(e, self.api_key)}")
+            print(f"请求地址: {self._chat_completions_url()} 模型: {self.model_name}")
+            return self._exception_error_result("API读取超时", e)
+        except (requests.exceptions.SSLError, requests.exceptions.ChunkedEncodingError) as e:
+            print(f"API传输中断: {clean_text(e, self.api_key)}")
+            print(f"请求地址: {self._chat_completions_url()} 模型: {self.model_name}")
+            return self._exception_error_result("API传输中断", e)
+        except requests.exceptions.ConnectionError as e:
+            print(f"API连接错误: {clean_text(e, self.api_key)}")
+            print(f"请求地址: {self._chat_completions_url()} 模型: {self.model_name}")
+            return self._exception_error_result("API连接错误", e)
+        except requests.exceptions.RequestException as e:
+            print(f"API请求异常: {clean_text(e, self.api_key)}")
+            print(f"请求地址: {self._chat_completions_url()} 模型: {self.model_name}")
+            return self._exception_error_result("API请求异常", e)
         except Exception as e:
-            print(f"格式化棋盘显示时出错: {e}")
+            print(f"流式API调用失败: {clean_text(e, self.api_key)}")
+            import traceback
+            return self._exception_error_result("流式API调用失败", e)
+
+    def format_board_display(self, board_state: str) -> str:
+        """将棋盘状态转换为带坐标的显示。兼容换行或 FEN 风格的斜杠分隔。"""
+        try:
+            raw = (board_state or "").strip()
+            if not raw:
+                return board_state
+            if "\n" in raw:
+                lines = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+            elif "/" in raw:
+                lines = raw.split("/")
+            else:
+                return board_state
+
+            # 去掉可能的空格后再检查每行是否为 9 个格子
+            cleaned = [ln.replace(" ", "") for ln in lines]
+            if len(cleaned) != 10 or any(len(ln) != 9 for ln in cleaned):
+                return board_state
+
+            display = "  a b c d e f g h i\n"
+            for i, line in enumerate(cleaned):
+                display += f"{i} " + " ".join(line) + f" {i}\n"
+            display += "  a b c d e f g h i"
+            return display
+        except Exception as e:
+            print(f"格式化棋盘显示时出错: {clean_text(e, self.api_key)}")
             return board_state
 
-    def build_chess_prompt(self, board_state: str, move_history: List[dict], legal_moves: List[str] = None) -> str:
-        """构建中国象棋提示词"""
-        
-        # 历史棋步字符串
-        history_str = ""
+    def build_chess_prompt(self, board_state: str, move_history: List[dict], legal_moves: List[str] = None, retry_hint: str = None, strict_output: bool = False, in_check: bool = False, checkers: List[str] = None) -> str:
+        """构建精简的中国象棋提示词：保留带坐标的棋盘和全部合法走法。"""
+        history_parts = []
         if move_history:
-            for i, move in enumerate(move_history[-10:], 1):  # 只显示最近10步
+            for move in move_history[-10:]:
                 notation = move.get('notation', move.get('move', ''))
-                player = "红方" if move.get('player') == 'red' else "黑方"
-                history_str += f"{i}. {player}: {notation}\n"
-        
-        # 当前轮次
+                player = "红" if move.get('player') == 'red' else "黑"
+                coord = move.get('move', '')
+                history_parts.append(f"{player}:{coord or notation}")
+        history_str = " ".join(history_parts) if history_parts else "开局"
+
         current_turn = "红方" if len(move_history) % 2 == 0 else "黑方"
-        
-        # 将棋盘状态转换为更直观的显示
         board_display = self.format_board_display(board_state)
-        
-        # 构建合法棋步列表字符串
-        legal_moves_str = ""
-        if legal_moves:
-            legal_moves_str = f"""
-【当前所有合法棋步】：
-你必须从以下合法棋步中选择一个：
-{', '.join(legal_moves[:50])}  # 显示前50个合法棋步
-总共有 {len(legal_moves)} 个合法棋步可选择。
+        legal_list = list(legal_moves or [])
+        legal_moves_str = ", ".join(legal_list) if legal_list else "（无）"
+        example = legal_list[0] if legal_list else "a0a1"
+        check_line = ""
+        if in_check:
+            src = f"（将军来自 {', '.join(checkers)}）" if checkers else ""
+            check_line = f"⚠️ 你正被将军{src}，必须应将（走开将/帅、垫子挡住或吃掉将军的子）。下面列表里只剩能解将的着法。\n"
 
-重要提醒：你只能选择上述列表中的棋步！选择其他棋步将导致游戏中断！
-"""
-        
-        # 棋盘说明
-        board_explanation = f"""
-棋盘格式说明：
-- 大写字母代表红方棋子：K=帅, A=仕, B=相, N=马, R=车, C=炮, P=兵
-- 小写字母代表黑方棋子：k=将, a=士, b=象, n=马, r=车, c=炮, p=卒
-- '.' 代表空位
-- 坐标系统：列用a-i表示(从左到右)，行用0-9表示(从上到下)
+        prompt = f"""你正在下中国象棋，执{current_turn}，已走{len(move_history)}步。请从合法棋步中选一步。
 
-当前棋盘状态（带坐标）：
+棋盘：列a-i（左到右），行0-9（上到下）。大写是红方，小写是黑方。K/k帅将 A/a仕士 B/b相象 N/n马 R/r车 C/c炮 P/p兵卒，.为空。
 {board_display}
+最近棋步：{history_str}
 
+{check_line}合法棋步（必须从中选一个，共{len(legal_list)}个；已排除走完后己方仍被将军或将帅照面的着法）：
 {legal_moves_str}
 
-【重要规则 - 必须严格遵守】：
-1. 你必须从上面提供的合法棋步列表中选择！
-2. 绝对不能移动到己方棋子占据的位置！
-3. 只能移动到空位（'.'）或吃掉对方棋子的位置
-4. 必须遵守各棋子的移动规则
-5. 兵/卒过河前只能向前，过河后可以左右移动
-6. 炮吃子需要跳过一个棋子，不吃子时路径必须畅通
-
-【棋步选择步骤】：
-1. 仔细查看上面提供的合法棋步列表
-2. 分析每个合法棋步的战术价值
-3. 从合法棋步中选择最佳的一个
-4. 确保你选择的棋步在合法列表中！
+按下面三行回复，分析与策略各用一句话即可。棋步必须是上面列表中的一项，使用小写字母，例如 {example}：
+分析：...
+策略：...
+棋步：{example}
 """
-        
-        prompt = f"""你是一位中国象棋大师，正在进行一场中国象棋对局。
-
-{board_explanation}
-
-当前局面信息：
-- 当前轮次: {current_turn}
-- 总步数: {len(move_history)}
-
-最近棋步历史：
-{history_str if history_str else "游戏刚开始"}
-
-请分析当前局面并选择你的下一步棋。
-
-要求：
-1. 仔细查看上面提供的合法棋步列表
-2. 分析当前局面的优劣势
-3. 考虑可能的战术和战略
-4. 从合法棋步列表中选择最佳的一个棋步
-5. 确保你选择的棋步在合法列表中！
-
-中国象棋规则提醒：
-- 帅/将只能在九宫格内移动，一次一格
-- 士/仕只能在九宫格内斜走
-- 相/象不能过河，走田字，不能被塞象眼
-- 马走日字，但可能被蹩腿
-- 车走直线，路径必须畅通
-- 炮走直线，吃子需要跳过一个棋子，不吃子时路径必须畅通
-- 兵/卒过河前只能向前，过河后可以左右移动
-
-请按以下格式回复：
-分析：[你对当前局面的分析，包括棋子位置观察]
-策略：[你的下棋策略和从合法棋步中的选择理由]
-棋步：[从合法棋步列表中选择的棋步，如a0a1]
-
-重要提醒：你必须从上面提供的合法棋步列表中选择！选择其他棋步将导致游戏中断！
-"""
+        if retry_hint:
+            prompt += f"\n上次错误：{retry_hint}\n请改选另一个合法棋步，棋步必须是上面列表中的一项。\n"
+        if strict_output:
+            prompt += f"\n这是最后一次机会。请只输出一行：\n棋步：{example}\n不要输出其他内容，xxxx 必须替换为合法列表中的一步。\n"
         return prompt
-    
-    def call_openai_api(self, prompt: str) -> str:
-        """调用OpenAI API"""
-        try:
-            client = openai.OpenAI(api_key=self.api_key)
-            response = client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "你是一位专业的中国象棋大师，擅长分析局面和制定策略。"},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=500,
-                temperature=0.7
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"OpenAI API调用失败: {e}")
+
+    def _normalize_move_text(self, text: str) -> str:
+        """把全角字母、数字、冒号转成半角，便于提取走法。"""
+        if not text:
             return ""
-    
-    def call_deepseek_api(self, prompt: str) -> str:
-        """调用DeepSeek API"""
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            data = {
-                "model": self.model_name,
-                "messages": [
-                    {"role": "system", "content": "你是一位专业的中国象棋大师，擅长分析局面和制定策略。"},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 500,
-                "temperature": 0.7
-            }
-            
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return response.json()["choices"][0]["message"]["content"]
-            else:
-                print(f"DeepSeek API错误: {response.status_code}")
-                return ""
-                
-        except Exception as e:
-            print(f"DeepSeek API调用失败: {e}")
-            return ""
-    
-    def call_claude_api(self, prompt: str) -> str:
-        """调用Claude API"""
-        try:
-            headers = {
-                "x-api-key": self.api_key,
-                "Content-Type": "application/json",
-                "anthropic-version": "2023-06-01"
-            }
-            data = {
-                "model": self.model_name,
-                "max_tokens": 500,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ]
-            }
-            
-            response = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return response.json()["content"][0]["text"]
-            else:
-                print(f"Claude API错误: {response.status_code}")
-                return ""
-                
-        except Exception as e:
-            print(f"Claude API调用失败: {e}")
-            return ""
-    
-    def call_generic_api(self, prompt: str) -> str:
-        """调用通用API（兼容OpenAI格式）"""
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            data = {
-                "model": self.model_name,
-                "messages": [
-                    {"role": "system", "content": "你是一位专业的中国象棋大师。"},
-                    {"role": "user", "content": prompt}
-                ],
-                "max_tokens": 500,
-                "temperature": 0.7
-            }
-            
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                return response.json()["choices"][0]["message"]["content"]
-            else:
-                return ""
-                
-        except Exception as e:
-            print(f"通用API调用失败: {e}")
-            return ""
-    
-    def parse_response(self, response: str) -> Optional[Dict]:
-        """解析模型响应，提取棋步和思考过程"""
+        trans = {}
+        for i in range(26):
+            trans[ord("Ａ") + i] = ord("a") + i
+            trans[ord("ａ") + i] = ord("a") + i
+        for i in range(10):
+            trans[ord("０") + i] = ord("0") + i
+        trans[ord("：")] = ord(":")
+        trans[ord("．")] = ord(".")
+        return text.translate(trans)
+
+    def parse_response(self, response: str, legal_moves: List[str] = None) -> Optional[Dict]:
+        """从模型最终正文中提取棋步；优先匹配合法走法列表。"""
         if not response:
             return None
-        
+
         try:
-            print(f"开始解析响应，响应长度: {len(response)}")
-            print(f"响应内容预览: {response[-500:]}")  # 显示最后500个字符
-            
-            # 提取分析内容
-            analysis_match = re.search(r'分析[：:]\s*(.+?)(?=策略|棋步|$)', response, re.DOTALL)
+            text = self._normalize_move_text(response)
+            print(f"开始解析响应，响应长度: {len(text)}")
+
+            analysis_match = re.search(r'分析[:：]\s*(.+?)(?=策略|棋步|$)', text, re.DOTALL | re.IGNORECASE)
             analysis = analysis_match.group(1).strip() if analysis_match else ""
-            
-            # 提取策略内容
-            strategy_match = re.search(r'策略[：:]\s*(.+?)(?=棋步|$)', response, re.DOTALL)
+            strategy_match = re.search(r'策略[:：]\s*(.+?)(?=棋步|$)', text, re.DOTALL | re.IGNORECASE)
             strategy = strategy_match.group(1).strip() if strategy_match else ""
-            
-            # 提取棋步（中国象棋坐标格式）- 更宽松的匹配
-            move_patterns = [
-                r'棋步[：:]\s*([a-i][0-9][a-i][0-9])',  # 标准格式：棋步：e6e7
-                r'([a-i][0-9][a-i][0-9])\s*$',          # 行末的坐标格式
-                r'([a-i][0-9][a-i][0-9])',              # 任何位置的坐标格式
-            ]
-            
+
+            legal_set = {m.lower() for m in (legal_moves or []) if m}
+
+            def assemble(a, b, c, d):
+                return f"{a}{b}{c}{d}".lower()
+
+            labeled = []
+            # 棋步：后允许出现 markdown/引号/括号
+            for m in re.finditer(r'棋步\s*[:：]\s*[\*`\[\(\s"“”]*([a-i])\s*([0-9])\s*[-–—到至]?\s*([a-i])\s*([0-9])', text, re.IGNORECASE):
+                labeled.append(assemble(m.group(1), m.group(2), m.group(3), m.group(4)))
+
+            all_moves = []
+            for m in re.finditer(r'([a-i])\s*([0-9])\s*[-–—到至]?\s*([a-i])\s*([0-9])', text, re.IGNORECASE):
+                all_moves.append(assemble(m.group(1), m.group(2), m.group(3), m.group(4)))
+
             move = None
-            for pattern in move_patterns:
-                move_match = re.search(pattern, response)
-                if move_match:
-                    move = move_match.group(1).lower()
-                    print(f"使用模式 '{pattern}' 找到棋步: {move}")
-                    break
-            
+            source = None
+            if legal_set:
+                legal_labeled = [x for x in labeled if x in legal_set]
+                legal_all = [x for x in all_moves if x in legal_set]
+                if legal_labeled:
+                    move = legal_labeled[-1]
+                    source = "棋步标签+合法列表"
+                elif legal_all:
+                    move = legal_all[-1]
+                    source = "正文中最后一个合法坐标"
+            if not move and labeled:
+                move = labeled[-1]
+                source = "棋步标签（未必合法）"
+            if not move and all_moves:
+                move = all_moves[-1]
+                source = "正文中的坐标（未必合法）"
+
             if move:
-                result = {
+                in_legal = (move in legal_set) if legal_set else None
+                print(f"解析到棋步: {move}（来源: {source}，在合法列表中: {in_legal}）")
+                return {
                     'move': move,
                     'analysis': analysis,
                     'strategy': strategy,
                     'thinking': f"分析: {analysis}\n策略: {strategy}",
-                    'raw_response': response
+                    'raw_response': response,
+                    'in_legal_list': in_legal,
                 }
-                print(f"成功解析棋步: {result}")
-                return result
-            else:
-                print(f"无法从响应中提取有效棋步")
-                print(f"完整响应内容: {response}")
-                return None
-                
-        except Exception as e:
-            print(f"解析响应时出错: {e}")
-            import traceback
-            traceback.print_exc()
+
+            print("无法从响应中提取有效棋步")
             return None
-    
+
+        except Exception as e:
+            print(f"解析响应时出错: {clean_text(e, self.api_key)}")
+            import traceback
+            return None
+
     def get_stats(self) -> Dict:
         """获取玩家统计信息"""
         avg_thinking_time = self.total_thinking_time / self.move_count if self.move_count > 0 else 0
