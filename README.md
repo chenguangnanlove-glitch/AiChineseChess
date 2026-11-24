@@ -113,6 +113,10 @@ python app.py
 
 结束程序：在运行它的终端里按 `Ctrl + C`。
 
+## 这次修复怎么覆盖更新
+
+如果项目已经在 `/Users/nan/Downloads/AiChineseChess-multi-game-src`，并且里面有可用的 `.venv`，按 `覆盖升级说明.txt` 把新文件盖上去即可。保留 `.venv` 和 `games`，不要再执行 `python3 -m venv`，也不必重新 `pip install`。
+
 ## 三种下法
 
 先在左侧选游戏（中国象棋或五子棋），再选对局方式。

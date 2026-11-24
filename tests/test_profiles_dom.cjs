@@ -120,6 +120,19 @@ function choose(w,id,v){const el=w.document.getElementById(id);el.value=v;el.dis
  const stored3=JSON.stringify(Object.keys(w.localStorage).map(k=>w.localStorage.getItem(k)));
  assert(!stored3.includes('sk-ant-testkey-not-real'));
  dom.window.close();
- console.log('PASS DOM: 双方独立选择、增改删/保存、刷新 key 清空且不落盘、手动显隐、仅确认后测试、运行时锁定、长日志展开与 HTML 转义、Claude 预设、本机空 key、地址尾缀自动去掉');
+ const low=[
+  {id:'ds-flash',display_name:'DeepSeek V4 Flash（更快）',provider:'deepseek',base_url:'https://api.deepseek.com/v1',model_name:'deepseek-flash',thinking_mode:'disabled',max_output:1024,timeout:90},
+  {id:'kimi-fast',display_name:'Kimi K3.1 Pro 高速版（更快）',provider:'kimi',base_url:'https://api.moonshot.cn/v1',model_name:'kimi-k3.1-pro-highspeed',thinking_mode:'low',max_output:1024,timeout:90},
+  {id:'ollama-local',display_name:'Ollama 本地模型',provider:'custom',base_url:'http://127.0.0.1:11434/v1',model_name:'llama3.2',thinking_mode:'disabled',max_output:1024,timeout:90},
+ ];
+ dom=await page({'aichess.apiProfiles.v1':JSON.stringify(low)});
+ const migrated=JSON.parse(dom.window.localStorage.getItem('aichess.apiProfiles.v1'));
+ const find=id=>migrated.find(p=>p.id===id);
+ assert.equal(find('ds-flash').max_output,4096);
+ assert.equal(find('kimi-fast').max_output,8192);
+ assert.equal(find('ollama-local').max_output,1024);
+ assert.match(dom.window.document.getElementById('profile-status').textContent,/输出上限/);
+ dom.window.close();
+ console.log('PASS DOM: 双方独立选择、增改删/保存、刷新 key 清空且不落盘、手动显隐、仅确认后测试、运行时锁定、长日志展开与 HTML 转义、Claude 预设、本机空 key、地址尾缀自动去掉、旧的低输出上限会调高且本机配置不动');
  console.log('NOTE: jsdom 不计算真实 CSS 布局；小屏/粘性工具栏需真实浏览器验收。');
 })().catch(e=>{console.error(e);process.exit(1);});

@@ -94,7 +94,7 @@ class LLMPlayer:
                     payload.setdefault("battle_id", battle_id)
             self.socketio.emit(event, payload)
     
-    def get_move(self, board_state: str, move_history: List[dict], legal_moves: List[str] = None, retry_hint: str = None, strict_output: bool = False, in_check: bool = False, checkers: List[str] = None, player_color: str = None, rules=None, stream_thinking: bool = True) -> Optional[Dict]:
+    def get_move(self, board_state: str, move_history: List[dict], legal_moves: List[str] = None, retry_hint: str = None, strict_output: bool = False, in_check: bool = False, checkers: List[str] = None, player_color: str = None, rules=None, stream_thinking: bool = True, output_budget=None) -> Optional[Dict]:
         """获取模型的下一步棋（支持流式输出）
         
         Args:
@@ -108,6 +108,11 @@ class LLMPlayer:
         """
         start_time = time.time()
         self._tls.suppress_stream = not stream_thinking
+        saved_budget = None
+        if output_budget is not None:
+            saved_budget = self.api_config.get('max_output')
+            self.api_config['max_output'] = int(output_budget)
+            self.max_output = int(output_budget)
         
         try:
             # 构建提示词。五子棋使用自己的棋盘说明和「落子」格式，不走象棋坐标。
@@ -152,17 +157,24 @@ class LLMPlayer:
             content = clean_text(api_result.get('content'), self.api_key)
             reasoning = clean_text(api_result.get('reasoning'), self.api_key)
             print(f"API调用完成，content长度: {len(content)}，reasoning长度: {len(reasoning)}，finish_reason={api_result.get('finish_reason')}")
+            finish_reason = api_result.get('finish_reason')
             if not content.strip():
-                reason = "模型正文content为空"
-                if api_result.get('finish_reason') == 'length':
-                    reason += "（finish_reason=length，可能在思考阶段就用尽了token上限）"
+                # 正文为空时不从 reasoning 里猜着法。length / max_tokens 是输出被截断，不是走法不合法。
+                if finish_reason in ("length", "max_tokens"):
+                    error_type = "truncated"
+                    reason = "模型正文是空的，回答在写出最终着法前被输出上限截断（finish_reason=%s）" % finish_reason
                 elif reasoning.strip():
-                    reason += "（只有reasoning_content，没有最终回答）"
+                    error_type = "reasoning_only"
+                    reason = "模型已结束，但正文是空的，只有思考内容"
+                else:
+                    error_type = "parse"
+                    reason = "模型正文是空的"
                 print(f"{self.display_name} {reason}")
                 return {
                     'move': None,
                     'error': reason,
-                    'error_type': 'parse',
+                    'error_type': error_type,
+                    'finish_reason': finish_reason,
                     'thinking': reasoning,
                     'raw_response': content,
                     'player': self.display_name,
@@ -188,10 +200,22 @@ class LLMPlayer:
                 return move_info
 
             print(f"{self.display_name} 无法从content中解析出棋步。失败原因：未匹配到坐标格式或合法走法")
+            # 正文被长度截断、里面还没有完整着法：同样按截断处理，仍不读 reasoning。
+            if finish_reason in ("length", "max_tokens"):
+                return {
+                    'move': None,
+                    'error': '回答被输出上限截断，正文里还没有完整着法（finish_reason=%s）' % finish_reason,
+                    'error_type': 'truncated',
+                    'finish_reason': finish_reason,
+                    'thinking': reasoning,
+                    'raw_response': content,
+                    'player': self.display_name,
+                }
             return {
                 'move': None,
-                'error': '无法从模型回复中解析出棋步（正文已收到，但没有可识别的坐标）',
+                'error': '模型有回复，但里面没有可识别的着法',
                 'error_type': 'parse',
+                'finish_reason': finish_reason,
                 'thinking': reasoning,
                 'raw_response': content,
                 'player': self.display_name,
@@ -214,6 +238,9 @@ class LLMPlayer:
             }
         finally:
             self._tls.suppress_stream = False
+            if saved_budget is not None:
+                self.api_config['max_output'] = saved_budget
+                self.max_output = saved_budget
     
     def _live_config(self):
         """用实例上当前的 base_url / api_key（测试或恢复对局可能已改写）。"""

@@ -9,6 +9,7 @@ import json
 from models.api_config import validate_config, build_payload, ConfigError, run_compat_request, parse_chat_completion_json, parse_anthropic_message
 from models.battle import ChessBattle
 from models.game_recorder import GameRecorder
+from models.output_budget import MAX_TRUNCATION_RAISES, next_truncation_budget, starting_budget
 from models.session import build_spec
 from models.network_errors import (
     network_backoff_schedule,
@@ -431,6 +432,23 @@ def play_human_turn(battle, color, player) -> str:
     return "stop"
 
 
+def _truncation_pause(player, side, budget, detail) -> str:
+    return (
+        f"{player.display_name}（{side}）这一步的正文是空的，回答在写出最终着法之前被输出上限截断。"
+        f"{detail} 程序已自动把这一步的输出上限试到 {budget}（不超过 8192），仍是同一个模型，仍然没有正文。"
+        f"这不是走法不合法，也不是棋力问题。思考过程里即使出现坐标，也不会拿来当棋步。"
+        f"点「继续对战」会按 {budget} 再试一次；若还是这样，请把该模型配置里的「最大输出 token」调高，停止后重新开局。"
+    )
+
+
+def _reasoning_pause(player, side) -> str:
+    return (
+        f"{player.display_name}（{side}）模型已经结束，但正文是空的，只有思考内容。"
+        f"程序不会从思考里猜着法，并已要求它只写最终一行，仍然没有正文。"
+        f"这不是走法不合法。点「继续对战」再试一次。"
+    )
+
+
 def play_one_turn(battle) -> str:
     """让当前一方走一步。返回 moved / stop / paused。"""
     game = battle.game
@@ -447,13 +465,23 @@ def play_one_turn(battle) -> str:
     print(f"当前玩家: {player.display_name} ({color})，合法{noun} {len(legal_moves)} 个" + ("，正被将军" if in_check else ""))
 
     illegal_attempts = 0
+    reasoning_retries = 0
+    truncation_raises = 0
     network_failures = 0
     backoff = network_backoff_schedule()
     retry_hint = None
+    force_brief = False
     last_detail = None
+    configured_budget = int(getattr(player, "max_output", 1024) or 1024)
+    budget = starting_budget(configured_budget, getattr(player, "session_output_budget", 0))
 
     while turn_still_current(battle, battle_id):
         thinking_msg = f"{player.display_name} 正在思考中..." + ("（正被将军，必须应将）" if in_check else "")
+        if truncation_raises or (force_brief and reasoning_retries):
+            if reasoning_retries and not truncation_raises:
+                thinking_msg = f"{player.display_name} 上一次正文是空的，正在要求只写最终一行（{reasoning_retries}/2）"
+            else:
+                thinking_msg = f"{player.display_name} 上一次正文被输出上限截断，正在用 {budget} 的上限重试同一步"
         # 人机对局不在思考过程中推送模型原文，避免提前泄露。
         emit_battle(battle, "thinking", {
             "player": color,
@@ -468,7 +496,8 @@ def play_one_turn(battle) -> str:
             move_history=list(game.move_history),
             legal_moves=list(legal_moves),
             retry_hint=retry_hint,
-            strict_output=(illegal_attempts > 0),
+            strict_output=(illegal_attempts > 0 or force_brief),
+            output_budget=budget,
             in_check=in_check,
             checkers=checkers,
             player_color=color,
@@ -524,17 +553,52 @@ def play_one_turn(battle) -> str:
             continue
 
         if outcome == "ok":
-            move_result = value
-            if not move_result or not move_result.get("move"):
-                detail = (move_result or {}).get("error") or "模型没有返回有效棋步"
-                if move_result and move_result.get("fatal"):
+            move_result = value or {}
+            kind = move_result.get("error_type")
+            if move_result.get("move"):
+                pass
+            elif kind == "truncated":
+                nxt = next_truncation_budget(budget)
+                retry_hint = f"上一次正文是空的，回答在写出最终{noun}前被输出上限截断。请只输出最终{noun}一行。这不是着法不合法。"
+                if nxt > budget and truncation_raises < MAX_TRUNCATION_RAISES:
+                    truncation_raises += 1
+                    budget = nxt
+                    force_brief = True
+                    msg = f"{player.display_name} 的正文被输出上限截断。正在用 {budget} 的上限自动重试同一步（{truncation_raises}/{MAX_TRUNCATION_RAISES}），仍是这个模型。"
+                    print(msg)
+                    set_phase(battle, "thinking", msg)
+                    continue
+                if not force_brief:
+                    force_brief = True
+                    msg = f"{player.display_name} 的正文仍被截断。输出上限已经是 {budget}，再请求一次，只要最终{noun}一行。"
+                    print(msg)
+                    set_phase(battle, "thinking", msg)
+                    continue
+                player.session_output_budget = budget
+                pause_battle(battle, _truncation_pause(player, side, budget, move_result.get("error") or ""), kind="truncated")
+                return "paused"
+            elif kind == "reasoning_only":
+                if reasoning_retries < 2:
+                    reasoning_retries += 1
+                    force_brief = True
+                    retry_hint = f"正文是空的，只有思考。请只输出最终{noun}一行。思考里的坐标不会被采用。"
+                    msg = f"{player.display_name} 已结束但正文是空的。不会从思考里猜{noun}，正在要求只写最终一行（{reasoning_retries}/2）。"
+                    print(msg)
+                    set_phase(battle, "thinking", msg)
+                    continue
+                pause_battle(battle, _reasoning_pause(player, side), kind="reasoning_only")
+                return "paused"
+            elif not move_result.get("move"):
+                detail = move_result.get("error") or "模型没有返回有效棋步"
+                if move_result.get("fatal"):
                     pause_battle(battle, f"{player.display_name} 接口报错：{detail}。网络/余额恢复后可继续；更换 key 或模型配置请先停止，再重新开局。", kind="api")
                     return "paused"
                 illegal_attempts += 1
                 last_detail = detail
+                force_brief = True
                 retry_hint = _hint(game, detail, legal_moves[0] if legal_moves else "")
-                print(f"无效棋步第 {illegal_attempts}/{MAX_ILLEGAL_ATTEMPTS} 次：{detail}")
-            else:
+                print(f"回复里没有合法{noun}，第 {illegal_attempts}/{MAX_ILLEGAL_ATTEMPTS} 次：{detail}")
+            if move_result.get("move"):
                 move = _canonical_move(game, move_result["move"])
                 applied = False
                 with state_lock:
@@ -550,13 +614,16 @@ def play_one_turn(battle) -> str:
                     retry_hint = _hint(game, last_detail, legal_moves[0] if legal_moves else "")
                     print(f"无效棋步第 {illegal_attempts}/{MAX_ILLEGAL_ATTEMPTS} 次：{last_detail}")
                 else:
+                    if budget > configured_budget:
+                        player.session_output_budget = budget
                     record_move(battle, player, color, move, move_result)
                     return "moved"
 
         if illegal_attempts >= MAX_ILLEGAL_ATTEMPTS:
             pause_battle(
                 battle,
-                f"{player.display_name}（{side}）连续 {MAX_ILLEGAL_ATTEMPTS} 次没有给出合法棋步（{last_detail}）。点「继续对战」让它再试。",
+                f"{player.display_name}（{side}）连续 {MAX_ILLEGAL_ATTEMPTS} 次的回复里都没有合法{noun}（{last_detail}）。"
+                f"这是回复内容的问题，不是输出被截断，也不是在评价棋力。点「继续对战」再试。",
                 kind="illegal",
             )
             return "paused"

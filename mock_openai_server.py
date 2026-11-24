@@ -21,15 +21,16 @@ def extract_gomoku_moves(prompt: str):
     """五子棋提示词里的合法落点。象棋提示词返回空列表。"""
     if not prompt or ("五子棋" not in prompt and "合法落点" not in prompt):
         return []
-    section = prompt
-    # 开头的「请从合法落点中选」不是列表；用最后一处「合法落点」标题后面的那一行。
-    markers = list(re.finditer(r"合法落点[^\n]*\n", prompt))
-    if markers:
-        section = prompt[markers[-1].end():]
+    found = []
+    # 提示词里「合法落点」会出现在说明句里。只采用后面真有坐标的那一段。
+    for marker in re.finditer(r"合法落点[^\n]*\n", prompt):
+        section = prompt[marker.end():]
         stop = re.search(r"\n\n", section)
-        if stop:
-            section = section[:stop.start()]
-    return re.findall(r"\b([A-O](?:1[0-5]|[1-9]))\b", section)
+        blob = section[:stop.start()] if stop else section
+        listed = re.findall(r"\b([A-O](?:1[0-5]|[1-9]))\b", blob)
+        if listed:
+            found = listed
+    return found
 
 
 def gomoku_reply(prompt: str):
@@ -102,19 +103,65 @@ def engine_pick(prompt: str, legal):
     return best
 
 
-def build_stream(prompt: str, style: str):
+def output_budget_of(payload):
+    payload = payload or {}
+    for key in ("max_tokens", "max_completion_tokens"):
+        if payload.get(key) is not None:
+            try:
+                return int(payload[key])
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def answer_override(payload):
+    """测试用：模拟截断、只有思考、或截断但正文里已有着法。默认不改变回复。"""
+    with state_lock:
+        mode = state.get("answer_mode") or ""
+        below = int(state.get("truncate_below") or 0)
+    if mode == "length_with_move":
+        return "length_with_move"
+    if mode == "reasoning_only":
+        return "reasoning_only"
+    if mode == "bad_move":
+        return "bad_move"
+    if below and output_budget_of(payload) < below:
+        return "truncate_empty"
+    return ""
+
+
+def apply_answer_override(content, reasoning, finish, override):
+    if override == "truncate_empty":
+        return "", "思考里提到 H8，但输出上限用完了，正文没有写出来。", "length"
+    if override == "reasoning_only":
+        return "", "思考里出现落子：H8，正文保持空白。", "stop"
+    if override == "bad_move":
+        return "落子：Z9", "没有按列表下", "stop"
+    if override == "length_with_move":
+        return content, reasoning, "length"
+    return content, reasoning, finish
+
+
+def sse_chunks(content, reasoning, finish, null_content=False):
+    chunks = [{"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}]
+    for i in range(0, len(reasoning), 8):
+        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": reasoning[i:i+8]}, "finish_reason": None}]})
+    if null_content:
+        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": None}, "finish_reason": None}]})
+    for i in range(0, len(content), 6):
+        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": content[i:i+6]}, "finish_reason": None}]})
+    chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}})
+    chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+    return chunks
+
+
+def build_stream(prompt: str, style: str, payload=None):
+    override = answer_override(payload)
     gomoku = gomoku_reply(prompt)
     if gomoku:
         content, reasoning, _move = gomoku
-        chunks = []
-        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
-        for i in range(0, len(reasoning), 8):
-            chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": reasoning[i:i+8]}, "finish_reason": None}]})
-        for i in range(0, len(content), 6):
-            chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": content[i:i+6]}, "finish_reason": None}]})
-        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}})
-        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
-        return chunks
+        content, reasoning, finish = apply_answer_override(content, reasoning, "stop", override)
+        return sse_chunks(content, reasoning, finish)
     legal = extract_legal_moves(prompt)
     move = legal[0] if legal else "a0a1"
     if style == "engine":
@@ -131,20 +178,8 @@ def build_stream(prompt: str, style: str):
         content = f"棋步：{move}"
     else:
         content = f"分析：局面平稳\n策略：出动右炮\n棋步：{move}"
-
-    chunks = []
-    chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
-    # reasoning first, like Kimi K3
-    for i in range(0, len(reasoning), 8):
-        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": reasoning[i:i+8]}, "finish_reason": None}]})
-    if style == "none_content_then_text":
-        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": None}, "finish_reason": None}]})
-    for i in range(0, len(content), 6):
-        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": content[i:i+6]}, "finish_reason": None}]})
-    # usage chunk with empty choices, as Kimi does
-    chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}})
-    chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
-    return chunks
+    content, reasoning, finish = apply_answer_override(content, reasoning, "stop", override)
+    return sse_chunks(content, reasoning, finish, null_content=(style == "none_content_then_text" and override == ""))
 
 
 def should_fail():
@@ -295,7 +330,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/control"):
             with state_lock:
-                for key in ("fail_remaining", "mode", "retry_after", "hang_seconds"):
+                for key in ("fail_remaining", "mode", "retry_after", "hang_seconds", "truncate_below", "answer_mode", "hang_from_request"):
                     if key in payload:
                         state[key] = payload[key]
                 if payload.get("reset_counts"):
@@ -304,6 +339,9 @@ class Handler(BaseHTTPRequestHandler):
                     state["request_count"] = 0
                     state["failed_count"] = 0
                     state["success_count"] = 0
+                    state["truncate_below"] = 0
+                    state["answer_mode"] = ""
+                    state["hang_from_request"] = 0
                 snapshot = dict(state)
             print(f"[mock] control updated: {snapshot}")
             self._json(200, snapshot)
@@ -340,6 +378,19 @@ class Handler(BaseHTTPRequestHandler):
             meta['path'] = self.path
             state.setdefault('requests', []).append(meta)
             del state['requests'][:-50]
+            hang_from = int(state.get("hang_from_request") or 0)
+            seen = state["request_count"]
+
+        if hang_from and seen >= hang_from:
+            import time as _t
+            end = _t.time() + float(state.get("hang_seconds") or 30)
+            while _t.time() < end:
+                _t.sleep(0.1)
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            return
 
         fail, mode, retry_after = should_fail()
         if fail:
@@ -452,7 +503,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        for chunk in build_stream(prompt, style):
+        for chunk in build_stream(prompt, style, payload):
             self.wfile.write(sse_chunk(chunk))
         self.wfile.write(b"data: [DONE]\n\n")
 

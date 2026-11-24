@@ -48,7 +48,8 @@ class PlatformTests(unittest.TestCase):
     def setUp(self):
         self.client.post("/api/reset_battle")
         with mock.state_lock:
-            mock.state.update(mode="ok", fail_remaining=0, requests=[], request_count=0, prompts=[], hang_seconds=2)
+            mock.state.update(mode="ok", fail_remaining=0, requests=[], request_count=0, prompts=[], hang_seconds=2,
+                              truncate_below=0, answer_mode="", hang_from_request=0)
         self.events = []
         self._real_emit = server.socketio.emit
 

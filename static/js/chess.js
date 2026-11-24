@@ -1094,7 +1094,8 @@ function applyBattleState(state) {
     } else if (phase === 'thinking') {
         const side = sideLabel(state.current_player);
         const hidden = state.mode === 'human_vs_ai' ? '。思考内容要等这步落下后才能展开' : '';
-        updateGameStatus(`等待${side}模型回复（${Math.round(waited)} 秒）${state.in_check ? '，正被将军' : ''}${hidden}`);
+        const retrying = state.phase_message && /截断|正文是空的|输出上限/.test(state.phase_message);
+        updateGameStatus(retrying ? state.phase_message : `等待${side}模型回复（${Math.round(waited)} 秒）${state.in_check ? '，正被将军' : ''}${hidden}`);
         if (!gameState.canRetryNow) setNetworkStatus('', '');
     } else if (phase === 'human_turn') {
         updateGameStatus(`轮到${sideLabel(state.current_player)}，请点击棋盘`);
