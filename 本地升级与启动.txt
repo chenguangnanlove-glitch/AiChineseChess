@@ -1,0 +1,32 @@
+弈台升级与启动（给自己看的短说明）
+
+这是中国象棋 + 五子棋。三种下法：人机、AI 对 AI、同机双人。
+五子棋是 15×15 自由规则，没有禁手，五子或以上获胜，不是职业连珠。
+
+升级：
+1. 在旧程序的终端按 Ctrl + C，等它停掉。
+2. 新代码放进新文件夹，不要盖住旧目录，也不要复制旧的 .venv。
+3. 想留旧棋谱，就把旧的 games 文件夹拷过来。旧棋谱没有「游戏种类」，那是以前的象棋 AI 对局。
+4. API key 不会被保存，打开新页面后要重新输入。
+
+macOS（含 2016 Intel MacBook Air / Monterey）：
+1. 从 https://www.python.org/downloads/macos/ 安装 Python 3.12。
+2. 打开「终端」，进入新文件夹，依次输入：
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   python app.py
+3. 浏览器打开 http://localhost:5003
+   页面像旧的话，按 Command + Shift + R。
+
+Windows：
+1. 安装 Python 3，勾选 Add python.exe to PATH。
+2. 在项目文件夹打开命令提示符：
+   python -m venv .venv
+   .venv\Scripts\activate
+   pip install -r requirements.txt
+   python app.py
+3. 浏览器打开 http://localhost:5003
+
+同机双人不用 key。人机只填 AI 那一边。AI 对 AI 两边分开填。
+正在下的时候改游戏或方式，要点「开始新局」并确认，才会换棋盘。

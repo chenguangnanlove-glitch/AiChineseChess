@@ -105,13 +105,18 @@ window.APIProfiles = (() => {
         selection[side] = byId(`${side}-model`).value;
         renderSide(side); writeStore(); lock(locked);
     }
+    function sideWord(side) {
+        const legend = document.querySelector(`.player-${side} legend`);
+        const text = legend && legend.textContent.trim();
+        return text || (side === 'red' ? '红方' : '黑方');
+    }
     function config(side, requireKey = true) {
         const p = profile(selection[side]);
-        if (!p) throw Error(`${side === 'red' ? '红' : '黑'}方：请先选择或添加 API 配置`);
+        if (!p) throw Error(`${sideWord(side)}：请先选择或添加 API 配置`);
         const key = byId(`${side}-api-key`).value.trim();
         const cfg = {...whitelist(p), thinking_mode:byId(`${side}-thinking-mode`).value, api_key:key};
         check(cfg);
-        if (requireKey && !key && !isLocalHost(cfg.base_url)) throw Error(`${side==='red'?'红':'黑'}方：请输入 API key（配置保存不包含 key；刷新后需重新输入）。本地模型如 Ollama 可留空`);
+        if (requireKey && !key && !isLocalHost(cfg.base_url)) throw Error(`${sideWord(side)}：请输入 API key（配置保存不包含 key；刷新后需重新输入）。本地模型如 Ollama 可留空`);
         if (key && /[\s\x00-\x1f]/.test(key)) throw Error('API key 不能含空白或换行');
         return cfg;
     }

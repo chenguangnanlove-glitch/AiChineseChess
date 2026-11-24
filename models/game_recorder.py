@@ -26,30 +26,64 @@ def _safe_name(text: str) -> str:
 class GameRecorder:
     """每步写一次完整 JSON（原子替换），便于事后做分析视频。"""
 
-    def __init__(self, red_player, black_player, games_dir: str):
+    def __init__(self, red_player, black_player, games_dir: str, *, game: str = "xiangqi",
+                 mode: str = "ai_vs_ai", players: dict = None, order: tuple = None,
+                 rules: str = "", labels: dict = None):
         os.makedirs(games_dir, exist_ok=True)
         started = datetime.now(TZ)
-        red_name = _safe_name(getattr(red_player, "model_name", "") or getattr(red_player, "display_name", "red"))
-        black_name = _safe_name(getattr(black_player, "model_name", "") or getattr(black_player, "display_name", "black"))
+        players = players or {"red": red_player, "black": black_player}
+        order = order or tuple(players.keys())
+        labels = labels or {}
+        names = []
+        participants = {}
+        for side in order:
+            player = players.get(side)
+            if player is None:
+                continue
+            kind = getattr(player, "kind", "ai")
+            entry = {
+                "role": "先手" if side == order[0] else "后手",
+                "side": side,
+                "side_label": labels.get(side, side),
+                "kind": kind,
+                "display_name": getattr(player, "display_name", ""),
+                "model_name": getattr(player, "model_name", ""),
+            }
+            participants[side] = entry
+            names.append(_safe_name(entry["model_name"] if kind == "ai" else entry["display_name"]))
         stamp = started.strftime("%Y%m%d-%H%M%S")
-        self.path = os.path.join(games_dir, f"{stamp}-{red_name}-vs-{black_name}.json")
+        versus = "-vs-".join(names) if names else "match"
+        self.path = os.path.join(games_dir, f"{stamp}-{game}-{mode}-{versus}.json")
         self.data = {
             "started_at": started.isoformat(timespec="seconds"),
             "updated_at": started.isoformat(timespec="seconds"),
             "timezone": "Asia/Shanghai",
-            "red": {
-                "display_name": getattr(red_player, "display_name", ""),
-                "model_name": getattr(red_player, "model_name", ""),
-            },
-            "black": {
-                "display_name": getattr(black_player, "display_name", ""),
-                "model_name": getattr(black_player, "model_name", ""),
-            },
+            "game": game,
+            "mode": mode,
+            "rules": rules,
+            "participants": participants,
             "status": "playing",
             "result": None,
             "pause_reason": None,
             "moves": [],
         }
+        # 中国象棋保留原来的 red / black 字段，旧的查看方式仍能读到双方名字。
+        if game == "xiangqi":
+            for side, legacy_name in (("red", "red"), ("black", "black")):
+                player = players.get(side)
+                if player is not None:
+                    self.data[legacy_name] = {
+                        "display_name": getattr(player, "display_name", ""),
+                        "model_name": getattr(player, "model_name", ""),
+                        "kind": getattr(player, "kind", "ai"),
+                    }
+        else:
+            for side, player in players.items():
+                self.data[side] = {
+                    "display_name": getattr(player, "display_name", ""),
+                    "model_name": getattr(player, "model_name", ""),
+                    "kind": getattr(player, "kind", "ai"),
+                }
         self.save()
 
     def add_move(self, *, player_color: str, player_name: str, model_name: str,

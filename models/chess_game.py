@@ -5,6 +5,8 @@ import os
 
 class ChessGame:
     """中国象棋游戏核心逻辑类"""
+
+    game_type = "xiangqi"
     
     def __init__(self):
         self.board = self.init_board()
@@ -30,6 +32,18 @@ class ChessGame:
             except ValueError:
                 pass
         return 300
+
+    def side_label(self, color: str) -> str:
+        return "红方" if color == "red" else "黑方"
+
+    def rules_summary(self) -> str:
+        return (
+            "中国象棋：已实现将军、应将、将死、困毙，以及默认双方合计 300 步仍未分胜负则判和。"
+            "长将、长捉等重复局面规则尚未实现，不是完整竞赛规则。"
+        )
+
+    def retry_hint(self, detail: str, example: str = "") -> str:
+        return f"{detail}。请严格按照「棋步：xxxx」格式回复，且必须是合法列表中的一步。"
 
     def init_board(self) -> List[List[str]]:
         """初始化中国象棋棋盘"""

@@ -17,6 +17,31 @@ state = {
 }
 
 
+def extract_gomoku_moves(prompt: str):
+    """五子棋提示词里的合法落点。象棋提示词返回空列表。"""
+    if not prompt or ("五子棋" not in prompt and "合法落点" not in prompt):
+        return []
+    section = prompt
+    # 开头的「请从合法落点中选」不是列表；用最后一处「合法落点」标题后面的那一行。
+    markers = list(re.finditer(r"合法落点[^\n]*\n", prompt))
+    if markers:
+        section = prompt[markers[-1].end():]
+        stop = re.search(r"\n\n", section)
+        if stop:
+            section = section[:stop.start()]
+    return re.findall(r"\b([A-O](?:1[0-5]|[1-9]))\b", section)
+
+
+def gomoku_reply(prompt: str):
+    moves = extract_gomoku_moves(prompt)
+    if not moves:
+        return None
+    move = moves[0]
+    reasoning = f"不要下中国象棋。棋步：h7e7 和 a0a1 都不是这里的走法。真正该落 {move}。"
+    content = f"分析：占住空点\n策略：往一条线上连\n落子：{move}"
+    return content, reasoning, move
+
+
 def extract_legal_moves(prompt: str):
     if not prompt:
         return []
@@ -78,6 +103,18 @@ def engine_pick(prompt: str, legal):
 
 
 def build_stream(prompt: str, style: str):
+    gomoku = gomoku_reply(prompt)
+    if gomoku:
+        content, reasoning, _move = gomoku
+        chunks = []
+        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]})
+        for i in range(0, len(reasoning), 8):
+            chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"reasoning_content": reasoning[i:i+8]}, "finish_reason": None}]})
+        for i in range(0, len(content), 6):
+            chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": content[i:i+6]}, "finish_reason": None}]})
+        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}})
+        chunks.append({"id": "mock-1", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+        return chunks
     legal = extract_legal_moves(prompt)
     move = legal[0] if legal else "a0a1"
     if style == "engine":
@@ -143,6 +180,10 @@ def extract_prompt(payload):
 
 
 def anthropic_message_body(prompt, style="default", testing=False):
+    gomoku = gomoku_reply(prompt)
+    if gomoku:
+        content, reasoning, move = gomoku
+        return reasoning, content, move
     legal = extract_legal_moves(prompt)
     move = legal[0] if legal else "a0a1"
     if style == "engine":
@@ -188,6 +229,18 @@ def write_anthropic_sse(handler, prompt, style):
 
 
 def chat_json_body(prompt, style="default"):
+    gomoku = gomoku_reply(prompt)
+    if gomoku:
+        content, reasoning, _move = gomoku
+        return {
+            "id": "mock-json",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content, "reasoning_content": reasoning},
+                "finish_reason": "stop",
+            }],
+        }
     legal = extract_legal_moves(prompt)
     move = legal[0] if legal else "a0a1"
     if style == "engine":
