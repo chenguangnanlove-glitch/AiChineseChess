@@ -2,6 +2,7 @@
 let socket;
 let gameState = {
     isPlaying: false,
+    isPaused: false,
     currentPlayer: 'red',
     moveCount: 0,
     startTime: null,
@@ -121,8 +122,6 @@ function streamThinkingProcessRealtime(player, content) {
     const thinkingBoxId = `${player}-thinking-process`;
     const thinkingBox = document.getElementById(thinkingBoxId);
     
-    console.log(`streamThinkingProcessRealtime调用: player=${player}, thinkingBoxId=${thinkingBoxId}`);
-    console.log('thinkingBox元素:', thinkingBox);
     
     if (!thinkingBox) {
         console.error(`找不到思考区元素: ${thinkingBoxId}`);
@@ -131,12 +130,10 @@ function streamThinkingProcessRealtime(player, content) {
     
     // 如果是第一次为该玩家创建流式元素
     if (!currentStreamingElements[player]) {
-        console.log(`为${player}创建新的流式元素`);
         
         // 如果是第一条消息，清空默认文本
         if (thinkingBox.innerHTML.includes('等待') || thinkingBox.innerHTML.includes('开始思考')) {
             thinkingBox.innerHTML = '';
-            console.log(`清空${player}的默认文本`);
         }
         
         // 创建思考项
@@ -159,7 +156,6 @@ function streamThinkingProcessRealtime(player, content) {
         
         // 保存当前流式元素的引用
         currentStreamingElements[player] = thinkingText;
-        console.log(`${player}的流式元素已创建并保存`);
     }
     
     // 追加内容到当前流式元素
@@ -167,7 +163,6 @@ function streamThinkingProcessRealtime(player, content) {
     if (streamElement) {
         streamElement.textContent += content;
         thinkingBox.scrollTop = thinkingBox.scrollHeight;
-        console.log(`成功向${player}的思考区添加内容: "${content.substring(0, 20)}..."`);
     } else {
         console.error(`${player}的流式元素不存在`);
     }
@@ -357,7 +352,6 @@ class ChessBoardRenderer {
     }
     
     updateBoard(boardState) {
-        console.log('updateBoard被调用，棋盘状态:', boardState);
         
         if (!boardState) {
             console.error('棋盘状态为空');
@@ -365,34 +359,28 @@ class ChessBoardRenderer {
         }
         
         // 清空棋盘并重绘
-        console.log('开始重绘棋盘...');
         this.drawBoard();
-        console.log('棋盘重绘完成');
         
         // 解析棋盘状态
         const rows = boardState.split('/');
-        console.log('解析后的行数据:', rows);
         
         for (let row = 0; row < 10; row++) {
             if (rows[row]) {
-                console.log(`处理第${row}行: ${rows[row]}`);
                 for (let col = 0; col < 9; col++) {
                     const piece = rows[row][col];
                     if (piece && piece !== '.') {
-                        console.log(`在位置(${col}, ${row})绘制棋子: ${piece}`);
                         this.drawPiece(col, row, piece);
                     }
                 }
             }
         }
         
+        this.drawCoordinates();
         // 高亮最后一步
         if (this.lastMove) {
-            console.log('高亮最后一步:', this.lastMove);
             this.highlightMove(this.lastMove);
         }
         
-        console.log('棋盘更新完成');
     }
     
     drawPiece(col, row, piece) {
@@ -455,9 +443,9 @@ class ChessBoardRenderer {
     }
     
     highlightSquare(col, row, color, alpha) {
-        const x = this.margin + (col + 0.5) * this.cellSize;
-        const y = this.margin + (row + 0.5) * this.cellSize;
-        const size = this.cellSize * 0.7;
+        const x = this.margin + col * this.cellWidth;
+        const y = this.margin + row * this.cellHeight;
+        const size = Math.min(this.cellWidth, this.cellHeight) * 0.9;
         
         this.ctx.fillStyle = color;
         this.ctx.globalAlpha = alpha;
@@ -490,13 +478,16 @@ function initializeApp() {
     // 初始化滚动管理器
     battleLogManager = new ScrollContainerManager('battle-log');
     
+    APIProfiles.init();
     // 绑定事件监听器
     bindEventListeners();
+
+    // 按当前下拉选项同步显示名和 base_url
+    updateModelSettings();
     
     // 初始化Socket事件
     initializeSocketEvents();
     
-    console.log('中国象棋应用初始化完成');
 }
 
 function bindEventListeners() {
@@ -508,33 +499,42 @@ function bindEventListeners() {
     
     // 重置游戏按钮
     document.getElementById('reset-battle').addEventListener('click', resetBattle);
+
+    const resumeBtn = document.getElementById('resume-battle');
+    if (resumeBtn) {
+        resumeBtn.addEventListener('click', resumeBattle);
+    }
     
     // 模型选择变化
-    document.getElementById('red-model').addEventListener('change', updateModelSettings);
-    document.getElementById('black-model').addEventListener('change', updateModelSettings);
+    document.getElementById('red-model').addEventListener('change', () => APIProfiles.select('red'));
+    document.getElementById('black-model').addEventListener('change', () => APIProfiles.select('black'));
 }
 
 function initializeSocketEvents() {
-    console.log('开始初始化Socket事件监听器...');
     
     // 连接状态
     socket.on('connect', function() {
         updateConnectionStatus('已连接');
-        console.log('Socket连接成功');
-        console.log('Socket ID:', socket.id);
         
         // 连接成功后重新绑定事件监听器
         bindThinkingStreamEvent();
+        // 刷新页面或断线重连后，从服务端恢复当前局面和按钮状态
+        syncBattleState();
     });
     
     socket.on('disconnect', function() {
-        updateConnectionStatus('连接断开');
-        console.log('Socket连接断开');
+        updateConnectionStatus('连接断开（自动重连中）');
+        if (gameState.isPlaying) {
+            setNetworkStatus('页面与本地服务的连接断开，正在自动重连；恢复后会同步局面', 'is-retrying');
+        }
+    });
+
+    socket.on('battle_state', function(state) {
+        applyBattleState(state);
     });
     
     // 游戏事件
     socket.on('thinking', function(data) {
-        console.log('收到thinking事件:', data);
         showThinkingStatus(data.player, data.message);
     });
     
@@ -542,38 +542,39 @@ function initializeSocketEvents() {
     bindThinkingStreamEvent();
     
     socket.on('move_made', function(data) {
-        console.log('收到move_made事件:', data);
         handleMoveMade(data);
     });
     
     socket.on('game_over', function(data) {
-        console.log('收到game_over事件:', data);
         handleGameOver(data);
     });
     
     socket.on('game_error', function(data) {
-        console.log('收到game_error事件:', data);
         handleGameError(data);
+    });
+
+    socket.on('network_retry', function(data) {
+        handleNetworkRetry(data);
+    });
+
+    socket.on('battle_paused', function(data) {
+        handleBattlePaused(data);
     });
     
     // 添加通用事件监听器来捕获所有事件
     socket.onAny(function(eventName, ...args) {
-        console.log(`收到Socket.IO事件: ${eventName}`, args);
     });
     
-    console.log('Socket事件监听器初始化完成');
 }
 
 // 单独的函数来绑定thinking_stream事件
 function bindThinkingStreamEvent() {
-    console.log('绑定thinking_stream事件监听器...');
     
     // 移除之前的监听器（如果存在）
     socket.off('thinking_stream');
     
     // 新增：处理流式思考过程
     socket.on('thinking_stream', function(data) {
-        console.log('收到thinking_stream事件:', data);
         
         // 确保数据格式正确
         if (!data || typeof data !== 'object') {
@@ -591,7 +592,6 @@ function bindThinkingStreamEvent() {
         
         if (data.is_complete) {
             // 思考完成，清理状态
-            console.log(`${data.player}思考完成`);
             clearStreamingState(data.player);
             return;
         }
@@ -619,12 +619,16 @@ function bindThinkingStreamEvent() {
         }
     });
     
-    console.log('thinking_stream事件监听器绑定完成');
 }
 
 function startBattle() {
-    const redConfig = getPlayerConfig('red');
-    const blackConfig = getPlayerConfig('black');
+    let redConfig, blackConfig;
+    try {
+        redConfig = getPlayerConfig('red');
+        blackConfig = getPlayerConfig('black');
+    } catch(e) { alert(e.message); return; }
+    if ([redConfig, blackConfig].some(c => c.base_url.startsWith('http:')) &&
+        !confirm('所选配置含 HTTP 地址。发往非本机服务时 key 会明文传输；本机 Ollama / LM Studio 通常可以继续。是否开始对战？')) return;
     
     if (!validateConfig(redConfig) || !validateConfig(blackConfig)) {
         alert('请填写完整的模型配置信息');
@@ -632,7 +636,14 @@ function startBattle() {
     }
     
     showLoading(true);
-    
+    gameState.canRetryNow = false;
+    gameState.isPaused = false;
+    gameState.lastGameOverKey = null;
+    gameState.stopRequestedAt = 0;
+    setNetworkStatus('', '');
+    clearGameInfo();
+    highlightWinner('');
+
     fetch('/api/start_battle', {
         method: 'POST',
         headers: {
@@ -647,11 +658,18 @@ function startBattle() {
     .then(data => {
         showLoading(false);
         if (data.status === 'success') {
-            gameState.isPlaying = true;
             gameState.startTime = new Date();
-            console.log('中国象棋对战已开始');
-            updateControlButtons(true);
-            clearGameInfo();
+            const sameBattle = data.state && gameState.battleId === data.state.battle_id;
+            if (!sameBattle) {
+                // 这盘棋的实时事件还没到：先按开局状态显示
+                gameState.isPlaying = true;
+                gameState.isPaused = false;
+                gameState.boardState = null;
+                gameState.moveCount = 0;
+                updateControlButtons(true);
+                if (data.state) applyBattleState(data.state);
+            }
+            // 否则事件（网络重连/暂停/走子）已先到，以事件为准，不覆盖
         } else {
             alert('启动对战失败: ' + data.message);
         }
@@ -664,91 +682,75 @@ function startBattle() {
 }
 
 function stopBattle() {
-    fetch('/api/stop_battle', {
-        method: 'POST'
-    })
+    gameState.stopRequestedAt = Date.now();
+    // 先在页面上立即生效，再通知后端（后端会取消正在进行的模型请求和重连等待）
+    gameState.isPlaying = false;
+    gameState.isPaused = false;
+    gameState.canRetryNow = false;
+    updateGameStatus('对战已停止');
+    setNetworkStatus('', '');
+    updateControlButtons(false);
+    hideThinkingStatus();
+    fetch('/api/stop_battle', { method: 'POST' })
     .then(response => response.json())
     .then(data => {
-        if (data.status === 'success') {
-            gameState.isPlaying = false;
-            updateGameStatus('对战已停止');
-            updateControlButtons(false);
-            hideThinkingStatus();
+        if (data.status !== 'success') {
+            console.warn('停止对战返回:', data);
+        } else if (data.state) {
+            applyBattleState(data.state);
         }
     })
     .catch(error => {
         console.error('停止对战错误:', error);
+        setNetworkStatus('连不上本地服务，请看终端里程序是否还在运行', '');
     });
 }
 
 function resetBattle() {
-    if (confirm('确定要重置游戏吗？这将清除所有对战记录。')) {
-        gameState = {
-            isPlaying: false,
-            currentPlayer: 'red',
-            moveCount: 0,
-            startTime: null,
-            boardState: null
-        };
-        
-        // 重置界面
-        updateGameStatus('等待开始');
-        updateControlButtons(false);
-        clearGameInfo();
-        boardRenderer.drawBoard();
-        boardRenderer.showInitialPosition();  // 重新显示初始位置
-        
-        // 重置统计信息
-        document.getElementById('current-round').textContent = '0';
-        document.getElementById('total-moves').textContent = '0';
-        document.getElementById('battle-duration').textContent = '00:00';
-        
-        console.log('中国象棋游戏已重置');
+    if (!confirm('确定要重置游戏吗？这将停止当前对局并清空页面（已保存的棋谱文件不会删除）。')) {
+        return;
     }
+    fetch('/api/reset_battle', { method: 'POST' }).catch(error => console.error('重置对战错误:', error));
+    resetLocalUI();
 }
 
-function getPlayerConfig(player) {
-    const prefix = player === 'red' ? 'red' : 'black';
-    
-    const config = {
-        model_name: document.getElementById(`${prefix}-model`).value,
-        api_key: document.getElementById(`${prefix}-api-key`).value,
-        display_name: document.getElementById(`${prefix}-display-name`).value
+function resetLocalUI() {
+    gameState = {
+        isPlaying: false,
+        isPaused: false,
+        canRetryNow: false,
+        currentPlayer: 'red',
+        moveCount: 0,
+        startTime: null,
+        boardState: null
     };
-    
-    // 添加base_url（红方和黑方都需要）
-    const baseUrlInput = document.getElementById(`${prefix}-base-url`);
-    if (baseUrlInput && baseUrlInput.value.trim()) {
-        config.base_url = baseUrlInput.value.trim();
-    }
-    
-    return config;
+    updateGameStatus('等待开始');
+    setNetworkStatus('', '');
+    updateControlButtons(false);
+    clearGameInfo();
+    boardRenderer.drawBoard();
+    boardRenderer.showInitialPosition();
+    updateCurrentPlayer('red');
+    document.getElementById('current-round').textContent = '0';
+    document.getElementById('total-moves').textContent = '0';
+    document.getElementById('battle-duration').textContent = '00:00';
+    const red = document.querySelector('.player-red');
+    const black = document.querySelector('.player-black');
+    if (red) red.classList.remove('winner-highlight');
+    if (black) black.classList.remove('winner-highlight');
 }
 
+function getPlayerConfig(player) { return APIProfiles.config(player); }
+function isLocalBase(url) {
+    try {
+        const host = new URL(url).hostname.replace(/^\[|\]$/g, '');
+        return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+    } catch (_) { return false; }
+}
 function validateConfig(config) {
-    return config.model_name && config.api_key && config.display_name;
+    return !!(config.model_name && config.display_name && (config.api_key || isLocalBase(config.base_url)));
 }
-
-function updateModelSettings() {
-    // 根据选择的模型更新默认设置
-    const redModel = document.getElementById('red-model').value;
-    const blackModel = document.getElementById('black-model').value;
-    
-    // 更新红方显示名称（使用硅基流动API）
-    if (redModel.includes('DeepSeek-V3')) {
-        document.getElementById('red-display-name').value = 'DeepSeek-V3';
-        document.getElementById('red-base-url').value = 'https://api.siliconflow.cn/v1';
-    } else if (redModel.includes('Qwen3-235B-A22B-Instruct-2507')) {
-        document.getElementById('red-display-name').value = 'Qwen3-235B-A22B-Instruct-2507';
-        document.getElementById('red-base-url').value = 'https://api.siliconflow.cn/v1';
-    }
-    
-    // 更新黑方显示名称（只有Gemini-2.5-Flash）
-    if (blackModel.includes('gemini')) {
-        document.getElementById('black-display-name').value = 'Gemini-2.5-Flash';
-        document.getElementById('black-base-url').value = 'https://generativelanguage.googleapis.com/v1beta';
-    }
-}
+function updateModelSettings() { /* APIProfiles 统一管理，初始化已完成。 */ }
 
 function showThinkingStatus(player, message) {
     // 不显示任何思考状态信息
@@ -767,51 +769,247 @@ function hideThinkingStatus() {
 }
 
 function handleMoveMade(data) {
-    console.log('收到中国象棋棋步:', data);
-    
-    // 更新棋盘
     if (data.board_state) {
         boardRenderer.updateBoard(data.board_state);
         boardRenderer.setLastMove(data.move);
         gameState.boardState = data.board_state;
     }
-    
-    // 更新当前执棋方显示
     if (data.current_player) {
         updateCurrentPlayer(data.current_player);
         gameState.currentPlayer = data.current_player;
     }
-    
-    // 更新统计信息
     gameState.moveCount = data.move_count || 0;
     document.getElementById('total-moves').textContent = gameState.moveCount;
     document.getElementById('current-round').textContent = Math.ceil(gameState.moveCount / 2);
-    
-    // 只在对战日志中显示简洁的棋步记录
-    addBattleLogEntry(`${data.player} 走了 ${data.move}`, 'move');
-    
-    // 更新对战时长
+    // 走成功了，说明网络已恢复
+    gameState.canRetryNow = false;
+    setNetworkStatus('', '');
+    updateControlButtons(gameState.isPlaying);
+    addBattleLogEntry(`${data.player} 走了 ${data.move}${data.gives_check ? '（将军！）' : ''}`, 'move');
     updateBattleDuration();
 }
 
+function resultText(result) {
+    if (!result) return '对局结束';
+    if (typeof result === 'string') return result;
+    return result.message || result.game_result || '对局结束';
+}
+
 function handleGameOver(data) {
-    console.log('中国象棋游戏结束:', data);
-    
     gameState.isPlaying = false;
+    gameState.isPaused = false;
+    gameState.canRetryNow = false;
+    setNetworkStatus('', '');
     updateControlButtons(false);
-    
-    // 高亮获胜方
-    highlightWinner(data.result);
+    const result = (data && data.result) || {};
+    const text = (data && data.message) || resultText(result);
+    if (data && data.board_state) {
+        boardRenderer.updateBoard(data.board_state);
+    }
+    updateGameStatus(`对局结束：${text}`);
+    addBattleLogEntry(`对局结束：${text}`, 'system');
+    try {
+        highlightWinner((data && data.winner_color) || result.winner_color || '');
+    } catch (e) {
+        console.error('高亮获胜方失败:', e);
+    }
+    const key = (data && data.record_path) || text;
+    if (gameState.lastGameOverKey !== key) {
+        gameState.lastGameOverKey = key;
+        // 稍等让棋盘先画完最后一步
+        setTimeout(() => alert(`对局结束：${text}${data && data.record_path ? '\n棋谱已保存：' + data.record_path : ''}`), 300);
+    }
 }
 
 function handleGameError(data) {
     console.error('中国象棋游戏错误:', data);
-    
+    let message = (data && data.message) ? String(data.message) : '未知错误';
+    message = message.replace(/。?请严格按照「棋步：xxxx」格式回复[^。]*。?/g, '');
+    updateGameStatus('对战出错：' + message);
+    addBattleLogEntry('对战出错：' + message, 'system');
+    // 状态以服务端为准（多数错误会转成可继续的暂停）
+    syncBattleState();
+}
+
+function setNetworkStatus(text, kind) {
+    const element = document.getElementById('network-status');
+    if (!element) {
+        return;
+    }
+    element.textContent = text || '';
+    if (text) document.getElementById('network-details').open = true;
+    element.className = 'network-status' + (kind ? ` ${kind}` : '');
+}
+
+function handleNetworkRetry(data) {
+    const message = (data && data.message) ? data.message : '网络问题，正在重连';
+    gameState.isPlaying = true;
+    gameState.isPaused = false;
+    gameState.canRetryNow = true;
+    setNetworkStatus(message + (data && data.detail ? `：${data.detail}` : ''), 'is-retrying');
+    updateGameStatus(message);
+    updateControlButtons(true);
+    addBattleLogEntry(message, 'system');
+}
+
+function handleBattlePaused(data) {
     gameState.isPlaying = false;
-    updateGameStatus('对战出错');
+    gameState.isPaused = true;
+    gameState.canRetryNow = false;
+    const detail = (data && data.message) ? data.message : '连不上 API 服务器，请检查网络/代理（建议国内网站直连）';
+    setNetworkStatus(detail, '');
+    updateGameStatus('已暂停，点「继续对战」接着下');
     updateControlButtons(false);
-    
-    alert(`对战出现错误: ${data.message}`);
+    addBattleLogEntry(`对局已暂停。${detail}`, 'system');
+}
+
+// 用服务端快照恢复界面：页面刷新、socket 重连、定时轮询都走这里
+function applyBattleState(state) {
+    if (!state) return;
+    // 丢弃过期快照（比已经收到的新状态更早），避免按钮被旧状态覆盖
+    if (state.red_player && state.black_player) {
+        document.getElementById('active-match').textContent = `红：${state.red_player.display_name} · 黑：${state.black_player.display_name}`;
+    }
+    if (state.battle_id) {
+        if (gameState.battleId === state.battle_id && typeof state.seq === 'number' && state.seq < (gameState.lastSeq || 0)) {
+            return;
+        }
+        // 刚点了停止：停止请求发出前的「进行中」快照不再采用
+        if (gameState.stopRequestedAt && Date.now() - gameState.stopRequestedAt < 3000
+            && gameState.battleId === state.battle_id && state.status === 'playing') {
+            return;
+        }
+        if (gameState.battleId !== state.battle_id) {
+            gameState.battleId = state.battle_id;
+        }
+        gameState.lastSeq = state.seq || 0;
+    }
+    if (state.status === 'no_battle') {
+        if (gameState.isPlaying || gameState.isPaused) {
+            gameState.isPlaying = false;
+            gameState.isPaused = false;
+            gameState.canRetryNow = false;
+            updateControlButtons(false);
+            setNetworkStatus('本地服务里没有正在进行的对局（可能重启过），请重新开始对战', '');
+        }
+        return;
+    }
+    if (state.board_state && state.board_state !== gameState.boardState) {
+        boardRenderer.updateBoard(state.board_state);
+        if (state.last_move) boardRenderer.setLastMove(state.last_move);
+        gameState.boardState = state.board_state;
+    }
+    if (state.current_player) {
+        updateCurrentPlayer(state.current_player);
+        gameState.currentPlayer = state.current_player;
+    }
+    const restoringLog = (gameState.moveCount || 0) === 0 && (state.move_count || 0) > 0
+        && battleLogManager && battleLogManager.container && !gameState.restoredLog;
+    gameState.moveCount = state.move_count || 0;
+    document.getElementById('total-moves').textContent = gameState.moveCount;
+    document.getElementById('current-round').textContent = Math.ceil(gameState.moveCount / 2);
+    if (restoringLog && Array.isArray(state.moves)) {
+        gameState.restoredLog = true;
+        addBattleLogEntry(`已恢复当前对局（${state.moves.length} 步）`, 'system');
+        state.moves.forEach(m => addBattleLogEntry(`${m.player_name} 走了 ${m.move}`, 'move'));
+    }
+    if (!gameState.startTime && state.status !== 'finished') {
+        gameState.startTime = new Date();
+    }
+
+    const phase = state.phase;
+    if (state.status === 'finished') {
+        if (gameState.lastGameOverKey !== (state.record_path || resultText(state.result))) {
+            handleGameOver({ result: state.result, message: resultText(state.result),
+                             winner_color: state.result && state.result.winner_color,
+                             record_path: state.record_path, board_state: state.board_state });
+        }
+        return;
+    }
+    if (state.status === 'stopped') {
+        gameState.isPlaying = false;
+        gameState.isPaused = false;
+        gameState.canRetryNow = false;
+        updateControlButtons(false);
+        updateGameStatus('对战已停止');
+        return;
+    }
+    if (state.can_resume) {
+        gameState.isPlaying = false;
+        gameState.isPaused = true;
+        gameState.canRetryNow = false;
+        const why = state.stalled ? '对战线程已停止' : (state.pause_reason || '已暂停');
+        setNetworkStatus(why.includes('继续对战') ? why : (why + '，点「继续对战」从当前局面接着下'), '');
+        updateGameStatus('已暂停');
+        updateControlButtons(false);
+        return;
+    }
+    gameState.isPlaying = true;
+    gameState.isPaused = false;
+    const waited = (state.server_time && state.phase_since) ? (state.server_time - state.phase_since) : 0;
+    // 网络重连中一律可点；等模型超过 90 秒也给按钮，免得干等
+    gameState.canRetryNow = !!state.can_retry_now && (phase === 'network_retry' || waited > 90);
+    if (phase === 'network_retry') {
+        setNetworkStatus(state.phase_message || '网络问题，正在重连', 'is-retrying');
+        updateGameStatus('网络重连中');
+    } else if (phase === 'thinking') {
+        const side = state.current_player === 'red' ? '红方' : '黑方';
+        updateGameStatus(`等待${side}模型回复（${Math.round(waited)} 秒）${state.in_check ? '，正被将军' : ''}`);
+        if (!gameState.canRetryNow) setNetworkStatus('', '');
+    } else {
+        updateGameStatus('对战进行中');
+    }
+    updateControlButtons(true);
+}
+
+function syncBattleState() {
+    return fetch('/api/get_battle_status')
+        .then(r => r.json())
+        .then(state => { applyBattleState(state); gameState.serverReachable = true; return state; })
+        .catch(err => {
+            console.warn('获取对战状态失败:', err);
+            if (gameState.isPlaying || gameState.isPaused) {
+                gameState.serverReachable = false;
+                setNetworkStatus('连不上本地象棋服务（终端里的程序可能停了），恢复后会自动同步', '');
+            }
+        });
+}
+
+function resumeBattle() {
+    const resumeBtn = document.getElementById('resume-battle');
+    if (resumeBtn) {
+        resumeBtn.disabled = true;
+    }
+    const retryNow = gameState.canRetryNow && gameState.isPlaying;
+    setNetworkStatus(retryNow ? '正在立即重试...' : '正在继续对局...', 'is-retrying');
+    fetch('/api/resume_battle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'success') {
+            gameState.isPlaying = true;
+            gameState.isPaused = false;
+            gameState.canRetryNow = false;
+            setNetworkStatus(data.action === 'retry_now' ? '已立即重试' : '已继续对局', 'is-ok');
+            updateGameStatus('对战进行中');
+            updateControlButtons(true);
+            addBattleLogEntry(data.action === 'retry_now' ? '已立即重新请求当前一方' : '已从当前局面继续对局', 'system');
+            if (data.state) applyBattleState(data.state);
+        } else {
+            alert('继续对局失败: ' + (data.message || '未知错误'));
+            syncBattleState();
+        }
+    })
+    .catch(error => {
+        console.error('继续对局错误:', error);
+        alert('继续对局时发生错误，请检查本地服务是否还在运行');
+    })
+    .finally(() => {
+        if (resumeBtn) resumeBtn.disabled = false;
+        updateControlButtons(gameState.isPlaying);
+    });
 }
 
 function updateConnectionStatus(status) {
@@ -829,8 +1027,18 @@ function updateGameStatus(status) {
 }
 
 function updateControlButtons(isPlaying) {
-    document.getElementById('start-battle').disabled = isPlaying;
-    document.getElementById('stop-battle').disabled = !isPlaying;
+    APIProfiles.lock(isPlaying || !!gameState.isPaused);
+    const paused = !!gameState.isPaused;
+    const retry = !!gameState.canRetryNow && !!isPlaying;
+    document.getElementById('start-battle').disabled = isPlaying || paused;
+    document.getElementById('stop-battle').disabled = !isPlaying && !paused;
+    const resumeBtn = document.getElementById('resume-battle');
+    if (resumeBtn) {
+        const show = paused || retry;
+        resumeBtn.style.display = show ? 'inline-block' : 'none';
+        resumeBtn.textContent = retry ? '立即重试' : '继续对战';
+        resumeBtn.title = retry ? '不等倒计时，马上重新请求当前一方' : '从当前局面、轮到的一方接着下';
+    }
 }
 
 function clearGameInfo() {
@@ -1018,8 +1226,8 @@ class ScrollContainerManager {
 let battleLogManager = null;
 
 function addBattleLogEntry(message, type = 'info') {
-    // 只显示棋步记录，过滤其他类型的消息
-    if (type !== 'move') {
+    // 显示棋步记录和关键系统提示（将军、网络重连、暂停、结束），过滤其他调试信息
+    if (type !== 'move' && type !== 'system') {
         return;
     }
     
@@ -1046,13 +1254,14 @@ function highlightWinner(result) {
     const redPlayerInfo = document.querySelector('.player-red');
     const blackPlayerInfo = document.querySelector('.player-black');
     
-    // 移除之前的高亮
-    redPlayerInfo.classList.remove('winner-highlight');
-    blackPlayerInfo.classList.remove('winner-highlight');
+    if (redPlayerInfo) redPlayerInfo.classList.remove('winner-highlight');
+    if (blackPlayerInfo) blackPlayerInfo.classList.remove('winner-highlight');
     
-    if (result.includes('红方')) {
+    const text = (typeof result === 'string') ? result : ((result && (result.winner_color || result.message)) || '');
+    if (!redPlayerInfo || !blackPlayerInfo) return;
+    if (text === 'red' || text.includes('红方获胜')) {
         redPlayerInfo.classList.add('winner-highlight');
-    } else if (result.includes('黑方')) {
+    } else if (text === 'black' || text.includes('黑方获胜')) {
         blackPlayerInfo.classList.add('winner-highlight');
     }
 }
@@ -1076,6 +1285,14 @@ function showLoading(show) {
     const loadingOverlay = document.getElementById('loading-overlay');
     loadingOverlay.style.display = show ? 'flex' : 'none';
 }
+
+// 兜底轮询：即使漏掉了 socket 事件，也能在几秒内显示正确的状态和按钮
+setInterval(() => {
+    if (document.hidden) return;
+    if (gameState.isPlaying || gameState.isPaused || gameState.serverReachable === false) {
+        syncBattleState();
+    }
+}, 4000);
 
 // 定时更新对战时长
 setInterval(() => {
