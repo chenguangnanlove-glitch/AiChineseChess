@@ -5,9 +5,9 @@ window.APIProfiles = (() => {
     const SELECTED = 'aichess.selectedProfiles.v1';
     const byId = id => document.getElementById(id);
     const defaults = [
-        ['ds-flash', 'DeepSeek V4 Flash（更快）', 'deepseek', 'deepseek-flash', 'disabled'],
-        ['ds-pro', 'DeepSeek V4 Pro（更强）', 'deepseek', 'deepseek-v4-pro', 'disabled'],
-        ['ds-chat', 'DeepSeek Chat（可能已停用）', 'deepseek', 'deepseek-chat', 'disabled'],
+        ['ds-flash', 'DeepSeek V4 Flash（更快）', 'deepseek', 'deepseek-flash', 'disabled', '', 4096, 90],
+        ['ds-pro', 'DeepSeek V4 Pro（更强）', 'deepseek', 'deepseek-v4-pro', 'disabled', '', 4096, 90],
+        ['ds-chat', 'DeepSeek Chat（可能已停用）', 'deepseek', 'deepseek-chat', 'disabled', '', 4096, 90],
         ['kimi-fast', 'Kimi K3.1 Pro 高速版（更快）', 'kimi', 'kimi-k3.1-pro-highspeed', 'low'],
         ['kimi-pro', 'Kimi K3.1 Pro（更强）', 'kimi', 'kimi-k3.1-pro', 'high'],
         ['gemini-25', 'Gemini 2.5 Flash', 'gemini', 'gemini-2.5-flash', 'disabled'],
@@ -42,8 +42,26 @@ window.APIProfiles = (() => {
             return true;
         } catch (_) { message('本地存储不可用，配置仅当前页面有效，请勿刷新。', true); return false; }
     }
+    function outputFloor(p) {
+        if (p.provider === 'kimi') return p.thinking_mode === 'high' ? 16384 : 8192;
+        if (p.provider === 'deepseek') return p.thinking_mode && p.thinking_mode !== 'disabled' ? 8192 : 4096;
+        if (p.provider === 'anthropic') return 2048;
+        return 0;
+    }
+    function migrateBudgets(list) {
+        const notes = [];
+        for (const p of list) {
+            const floor = outputFloor(p);
+            if (floor && Number(p.max_output) < floor) {
+                notes.push(`${p.display_name} 的最大输出 token 从 ${p.max_output} 调到 ${floor}`);
+                p.max_output = floor;
+            }
+        }
+        return notes;
+    }
     function readStore() {
         const fresh = () => defaults.map(([id,display_name,provider,model_name,thinking_mode,base_url,max_output,timeout]) => ({id,display_name,provider,model_name,thinking_mode,base_url:base_url||urls[provider]||'',max_output:max_output||(provider==='kimi'?16384:provider==='anthropic'?4096:1024),timeout:timeout||((provider==='gemini'||provider==='anthropic')?180:90)}));
+        let migrated = [];
         try {
             const stored = localStorage.getItem(STORE);
             profiles = stored === null ? fresh() : JSON.parse(stored).map(whitelist).filter(p => {
@@ -55,8 +73,11 @@ window.APIProfiles = (() => {
             }
             const chosen = JSON.parse(localStorage.getItem(SELECTED) || '{}');
             ['red','black'].forEach(side => { if (profile(chosen[side])) selection[side] = chosen[side]; });
+            migrated = migrateBudgets(profiles);
+            if (migrated.length) writeStore();
         } catch (_) { profiles = fresh(); }
         ['red','black'].forEach(side => { if (!profile(selection[side])) selection[side] = profiles[0]?.id || ''; });
+        return migrated;
     }
     function check(p) {
         if (!p.display_name?.trim() || p.display_name.length > 100) throw Error('显示名称不能为空，最长 100 字符');
@@ -105,13 +126,18 @@ window.APIProfiles = (() => {
         selection[side] = byId(`${side}-model`).value;
         renderSide(side); writeStore(); lock(locked);
     }
+    function sideWord(side) {
+        const legend = document.querySelector(`.player-${side} legend`);
+        const text = legend && legend.textContent.trim();
+        return text || (side === 'red' ? '红方' : '黑方');
+    }
     function config(side, requireKey = true) {
         const p = profile(selection[side]);
-        if (!p) throw Error(`${side === 'red' ? '红' : '黑'}方：请先选择或添加 API 配置`);
+        if (!p) throw Error(`${sideWord(side)}：请先选择或添加 API 配置`);
         const key = byId(`${side}-api-key`).value.trim();
         const cfg = {...whitelist(p), thinking_mode:byId(`${side}-thinking-mode`).value, api_key:key};
         check(cfg);
-        if (requireKey && !key && !isLocalHost(cfg.base_url)) throw Error(`${side==='red'?'红':'黑'}方：请输入 API key（配置保存不包含 key；刷新后需重新输入）。本地模型如 Ollama 可留空`);
+        if (requireKey && !key && !isLocalHost(cfg.base_url)) throw Error(`${sideWord(side)}：请输入 API key（配置保存不包含 key；刷新后需重新输入）。本地模型如 Ollama 可留空`);
         if (key && /[\s\x00-\x1f]/.test(key)) throw Error('API key 不能含空白或换行');
         return cfg;
     }
@@ -130,7 +156,7 @@ window.APIProfiles = (() => {
         byId('provider-help').textContent=({
             custom:'自定义仅发送 model / messages / stream / max_tokens。若服务只认 max_completion_tokens 或不支持流式，程序会自动重试。Ollama（http://127.0.0.1:11434/v1）和 LM Studio 等本机模型可留空 API key。',
             gemini:'使用 Google 的 OpenAI 兼容根地址，不是 Gemini 原生 generateContent 接口；不发送厂商思考参数。',
-            deepseek:'只在 DeepSeek 模板发送 thinking、reasoning_effort 与 max_tokens。开启思考时请提高输出上限。',
+            deepseek:'只在 DeepSeek 模板发送 thinking、reasoning_effort 与 max_tokens。输出上限含思考。默认至少 4096；若正文仍被截断，对局会临时提高到不超过 8192，不换模型。',
             kimi:'Kimi 模板发送 reasoning_effort 与 max_completion_tokens；不能完全关思考。上限含思考 token，过低可能没有最终棋步。',
             anthropic:'使用 Anthropic 官方 Messages API（不是 OpenAI 格式）。默认地址 https://api.anthropic.com/v1，程序会自动请求 /messages。请填写控制台中的准确模型 ID（如 claude-sonnet-4-5）。'
         })[p];
@@ -178,7 +204,8 @@ window.APIProfiles = (() => {
         byId('config-lock-note').textContent=locked?'当前对局进行/暂停中，配置锁定；可继续当前对局，或停止后修改下一局配置。':'停止状态：配置修改只用于下一局。key 不会被保存。';
     }
     function init() {
-        readStore(); renderSelections(); loadEditor(profiles[0]?.id);
+        const migrated = readStore(); renderSelections(); loadEditor(profiles[0]?.id);
+        if (migrated && migrated.length) message('已自动提高过低的输出上限，避免回答在写出棋步前被截断（不是换模型）：' + migrated.join('；') + '。');
         ['red','black'].forEach(side=>{
             byId(`${side}-api-key`).addEventListener('input',()=>keys.set(`${side}:${selection[side]}`,byId(`${side}-api-key`).value));
             document.querySelector(`.test-side[data-side="${side}"]`).addEventListener('click',()=>test(side));
@@ -189,7 +216,7 @@ window.APIProfiles = (() => {
         byId('profile-provider').addEventListener('change',()=>{
             const p=byId('profile-provider').value;byId('profile-url').value=urls[p];
             modeOptions(byId('profile-thinking'),p);
-            byId('profile-max').value=p==='kimi'?16384:(p==='anthropic'?4096:1024);
+            byId('profile-max').value=p==='kimi'?16384:(p==='deepseek'||p==='anthropic'?4096:1024);
             byId('profile-timeout').value=(p==='gemini'||p==='anthropic')?180:90;
             providerHelp();
         });

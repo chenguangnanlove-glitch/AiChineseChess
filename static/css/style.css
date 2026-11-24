@@ -5,3 +5,5 @@
 @media(max-height:560px) and (min-width:721px){.board-container{width:min(100%,340px)}.app-header{padding-block:8px}.container{padding-top:12px}}
 @media(max-width:380px){.form-grid{grid-template-columns:1fr}.form-grid .wide{grid-column:auto}.control-buttons{gap:5px}.btn{font-size:12px}}
 .endpoint-summary{white-space:pre-line}.api-manager summary{padding-inline:0}
+.hidden{display:none !important}.choice-row{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0}.choice-row label{font-weight:550}.action-error{min-height:1.3em;margin:8px 0 0;color:#a52a35;font-size:13px;text-align:center;overflow-wrap:anywhere}.sealed-thinking{margin:8px 0;padding-top:6px;border-top:1px dashed var(--line)}.sealed-thinking summary{padding:4px 0;color:var(--blue);font-weight:600}#chess-board.can-click{cursor:pointer}.board-container.gomoku{width:min(100%,560px,calc(100vh - 230px))}.think-box.human-hidden .thinking-content{color:var(--muted)}
+@media(max-width:720px){.board-container.gomoku{width:min(100%,100%)}.choice-row{gap:10px}}

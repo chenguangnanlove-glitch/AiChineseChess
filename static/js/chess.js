@@ -6,20 +6,32 @@ let gameState = {
     currentPlayer: 'red',
     moveCount: 0,
     startTime: null,
-    boardState: null
+    boardState: null,
+    game: 'xiangqi',
+    mode: 'human_vs_ai',
+    yourTurn: false,
+    legalMoves: [],
+    battleId: null,
+    ignoreEvents: false,
+    selected: null,
+    mountedGame: null
 };
 
 // 更新当前执棋方显示
+function sideLabel(player) {
+    const labels = gameState.sideLabels || {};
+    if (labels[player]) return labels[player];
+    if (player === 'red') return '红方';
+    if (player === 'white') return '白棋';
+    if (player === 'black' && gameState.game === 'gomoku') return '黑棋';
+    return '黑方';
+}
+
 function updateCurrentPlayer(player) {
     const currentPlayerText = document.getElementById('current-player-text');
     if (currentPlayerText) {
-        if (player === 'red') {
-            currentPlayerText.textContent = '当前轮到红方执棋';
-            currentPlayerText.className = 'red-turn';
-        } else {
-            currentPlayerText.textContent = '当前轮到黑方执棋';
-            currentPlayerText.className = 'black-turn';
-        }
+        currentPlayerText.textContent = `当前轮到${sideLabel(player)}`;
+        currentPlayerText.className = (player === 'black') ? 'black-turn' : 'red-turn';
     }
 }
 
@@ -194,6 +206,8 @@ class ChessBoardRenderer {
         
         this.pieces = {};
         this.lastMove = null;
+        this.boardState = null;
+        this.hints = {selected: null, targets: []};
         
         this.initializePieces();
         this.drawBoard();
@@ -357,6 +371,7 @@ class ChessBoardRenderer {
             console.error('棋盘状态为空');
             return;
         }
+        this.boardState = boardState;
         
         // 清空棋盘并重绘
         this.drawBoard();
@@ -380,7 +395,52 @@ class ChessBoardRenderer {
         if (this.lastMove) {
             this.highlightMove(this.lastMove);
         }
+        if (this.hints && this.hints.selected) {
+            const col = this.hints.selected.charCodeAt(0) - 97;
+            const row = parseInt(this.hints.selected.slice(1), 10);
+            this.highlightSquare(col, row, '#f0c14a', 0.55);
+        }
+        (this.hints && this.hints.targets ? this.hints.targets : []).forEach((coord) => {
+            this.highlightSquare(coord.charCodeAt(0) - 97, parseInt(coord.slice(1), 10), '#3c9d62', 0.38);
+        });
         
+    }
+
+    mount() {
+        this.boardWidth = 520;
+        this.boardHeight = 580;
+        this.margin = 40;
+        this.canvas.width = this.boardWidth + this.margin * 2;
+        this.canvas.height = this.boardHeight + this.margin * 2;
+        this.cellWidth = this.boardWidth / 8;
+        this.cellHeight = this.boardHeight / 9;
+        this.canvas.classList.remove('gomoku-canvas');
+        this.canvas.setAttribute('aria-label', '中国象棋棋盘');
+        if (this.boardState) this.updateBoard(this.boardState);
+        else this.showInitialPosition();
+    }
+
+    cellFromEvent(ev) {
+        const rect = this.canvas.getBoundingClientRect();
+        const scaleX = this.canvas.width / (rect.width || this.canvas.width);
+        const scaleY = this.canvas.height / (rect.height || this.canvas.height);
+        const x = (ev.clientX - rect.left) * scaleX;
+        const y = (ev.clientY - rect.top) * scaleY;
+        const col = Math.round((x - this.margin) / this.cellWidth);
+        const row = Math.round((y - this.margin) / this.cellHeight);
+        if (col < 0 || col > 8 || row < 0 || row > 9) return null;
+        const cx = this.margin + col * this.cellWidth;
+        const cy = this.margin + row * this.cellHeight;
+        const dx = x - cx;
+        const dy = y - cy;
+        const limit = Math.min(this.cellWidth, this.cellHeight) * 0.48;
+        if (dx * dx + dy * dy > limit * limit) return null;
+        return {col, row, coord: String.fromCharCode(97 + col) + String(row)};
+    }
+
+    setHints(selected, targets) {
+        this.hints = {selected: selected || null, targets: targets || []};
+        if (this.boardState) this.updateBoard(this.boardState);
     }
     
     drawPiece(col, row, piece) {
@@ -479,6 +539,7 @@ function initializeApp() {
     battleLogManager = new ScrollContainerManager('battle-log');
     
     APIProfiles.init();
+    bindPlatformControls();
     // 绑定事件监听器
     bindEventListeners();
 
@@ -508,6 +569,10 @@ function bindEventListeners() {
     // 模型选择变化
     document.getElementById('red-model').addEventListener('change', () => APIProfiles.select('red'));
     document.getElementById('black-model').addEventListener('change', () => APIProfiles.select('black'));
+    const canvas = document.getElementById('chess-board');
+    if (canvas) {
+        canvas.addEventListener('click', onBoardClick);
+    }
 }
 
 function initializeSocketEvents() {
@@ -535,7 +600,19 @@ function initializeSocketEvents() {
     
     // 游戏事件
     socket.on('thinking', function(data) {
+        if (!acceptLive(data)) return;
         showThinkingStatus(data.player, data.message);
+    });
+    socket.on('your_turn', function(data) {
+        if (!acceptLive(data)) return;
+        gameState.yourTurn = true;
+        gameState.legalMoves = data.legal_moves || gameState.legalMoves;
+        setActionError('');
+        updateClickHint();
+    });
+    socket.on('move_rejected', function(data) {
+        if (!acceptLive(data)) return;
+        setActionError((data && data.message) || '这一步没有被接受');
     });
     
     // 初始绑定thinking_stream事件
@@ -581,6 +658,9 @@ function bindThinkingStreamEvent() {
             console.error('thinking_stream数据格式错误:', data);
             return;
         }
+        if (!acceptLive(data)) return;
+        // 人机对局在落子前不展示模型思考，避免页面或推送提前泄密。
+        if (gameState.mode === 'human_vs_ai') return;
         
         const thinkingBoxId = `${data.player}-thinking-process`;
         const thinkingBox = document.getElementById(thinkingBoxId);
@@ -622,25 +702,33 @@ function bindThinkingStreamEvent() {
 }
 
 function startBattle() {
-    let redConfig, blackConfig;
+    const setup = readSetup();
+    let payload;
     try {
-        redConfig = getPlayerConfig('red');
-        blackConfig = getPlayerConfig('black');
-    } catch(e) { alert(e.message); return; }
-    if ([redConfig, blackConfig].some(c => c.base_url.startsWith('http:')) &&
-        !confirm('所选配置含 HTTP 地址。发往非本机服务时 key 会明文传输；本机 Ollama / LM Studio 通常可以继续。是否开始对战？')) return;
-    
-    if (!validateConfig(redConfig) || !validateConfig(blackConfig)) {
-        alert('请填写完整的模型配置信息');
+        payload = buildStartPayload(setup);
+    } catch (e) {
+        alert(e.message);
         return;
     }
-    
+    if (gameState.isPlaying || gameState.isPaused) {
+        const ok = confirm('当前对局还没结束。开始新局会立刻停止这一盘，棋盘和思考都会清空，上一盘的棋子不会带进新局。确定开始新局？');
+        if (!ok) return;
+        payload.confirm_replace = true;
+    }
+    const configs = [payload.red_player, payload.black_player, payload.white_player].filter(Boolean);
+    if (configs.some(c => c.base_url && c.base_url.startsWith('http:')) &&
+        !confirm('所选配置含 HTTP 地址。发往非本机服务时 key 会明文传输；本机 Ollama / LM Studio 通常可以继续。是否开始对战？')) return;
+
     showLoading(true);
+    gameState.ignoreEvents = true;
+    gameState.battleId = 'none';
     gameState.canRetryNow = false;
     gameState.isPaused = false;
     gameState.lastGameOverKey = null;
     gameState.stopRequestedAt = 0;
+    gameState.selected = null;
     setNetworkStatus('', '');
+    setActionError('');
     clearGameInfo();
     highlightWinner('');
 
@@ -649,29 +737,33 @@ function startBattle() {
         headers: {
             'Content-Type': 'application/json'
         },
-        body: JSON.stringify({
-            red_player: redConfig,
-            black_player: blackConfig
-        })
+        body: JSON.stringify(payload)
     })
     .then(response => response.json())
     .then(data => {
         showLoading(false);
         if (data.status === 'success') {
             gameState.startTime = new Date();
-            const sameBattle = data.state && gameState.battleId === data.state.battle_id;
-            if (!sameBattle) {
-                // 这盘棋的实时事件还没到：先按开局状态显示
-                gameState.isPlaying = true;
-                gameState.isPaused = false;
-                gameState.boardState = null;
-                gameState.moveCount = 0;
-                updateControlButtons(true);
-                if (data.state) applyBattleState(data.state);
-            }
-            // 否则事件（网络重连/暂停/走子）已先到，以事件为准，不覆盖
+            gameState.lastSeq = 0;
+            gameState.restoredLog = false;
+            gameState.battleId = data.state && data.state.battle_id;
+            gameState.ignoreEvents = false;
+            gameState.isPlaying = true;
+            gameState.isPaused = false;
+            gameState.boardState = null;
+            gameState.mountedGame = null;
+            gameState.moveCount = 0;
+            gameState.selected = null;
+            updateControlButtons(true);
+            if (data.state) applyBattleState(data.state);
         } else {
-            alert('启动对战失败: ' + data.message);
+            gameState.ignoreEvents = false;
+            if (data.error_type === 'confirm_required') {
+                alert(data.message || '请先确认结束当前对局');
+            } else {
+                alert('启动对战失败: ' + (data.message || '未知错误'));
+            }
+            syncBattleState();
         }
     })
     .catch(error => {
@@ -715,14 +807,23 @@ function resetBattle() {
 }
 
 function resetLocalUI() {
+    const setup = readSetup();
     gameState = {
         isPlaying: false,
         isPaused: false,
         canRetryNow: false,
-        currentPlayer: 'red',
+        currentPlayer: setup.game === 'gomoku' ? 'black' : 'red',
         moveCount: 0,
         startTime: null,
-        boardState: null
+        boardState: null,
+        game: setup.game,
+        mode: setup.mode,
+        yourTurn: false,
+        legalMoves: [],
+        battleId: 'none',
+        ignoreEvents: false,
+        selected: null,
+        mountedGame: null
     };
     updateGameStatus('等待开始');
     setNetworkStatus('', '');
@@ -730,7 +831,9 @@ function resetLocalUI() {
     clearGameInfo();
     boardRenderer.drawBoard();
     boardRenderer.showInitialPosition();
-    updateCurrentPlayer('red');
+    updateCurrentPlayer(gameState.currentPlayer);
+    showIdleBoard(gameState.game);
+    refreshSetupCopy();
     document.getElementById('current-round').textContent = '0';
     document.getElementById('total-moves').textContent = '0';
     document.getElementById('battle-duration').textContent = '00:00';
@@ -769,9 +872,13 @@ function hideThinkingStatus() {
 }
 
 function handleMoveMade(data) {
+    if (!acceptLive(data)) return;
+    gameState.selected = null;
+    if ((data.game || gameState.game) !== 'gomoku' && window.boardRenderer && window.boardRenderer.setHints) {
+        window.boardRenderer.setHints(null, []);
+    }
     if (data.board_state) {
-        boardRenderer.updateBoard(data.board_state);
-        boardRenderer.setLastMove(data.move);
+        paintBoard(data.game || gameState.game, data.board_state, data.move);
         gameState.boardState = data.board_state;
     }
     if (data.current_player) {
@@ -785,8 +892,13 @@ function handleMoveMade(data) {
     gameState.canRetryNow = false;
     setNetworkStatus('', '');
     updateControlButtons(gameState.isPlaying);
-    addBattleLogEntry(`${data.player} 走了 ${data.move}${data.gives_check ? '（将军！）' : ''}`, 'move');
+    const verb = data.action_text || (gameState.game === 'gomoku' ? '落子' : '走了');
+    addBattleLogEntry(`${data.player} ${verb} ${data.move}${data.gives_check ? '（将军！）' : ''}`, 'move');
+    if (data.thinking_hidden) {
+        showSealedThinking(data.player_color, data.move, data.sealed_thinking, data.sealed_analysis, data.sealed_strategy);
+    }
     updateBattleDuration();
+    setActionError('');
 }
 
 function resultText(result) {
@@ -796,6 +908,7 @@ function resultText(result) {
 }
 
 function handleGameOver(data) {
+    if (data && !acceptLive(data)) return;
     gameState.isPlaying = false;
     gameState.isPaused = false;
     gameState.canRetryNow = false;
@@ -804,7 +917,7 @@ function handleGameOver(data) {
     const result = (data && data.result) || {};
     const text = (data && data.message) || resultText(result);
     if (data && data.board_state) {
-        boardRenderer.updateBoard(data.board_state);
+        paintBoard((data && data.game) || gameState.game, data.board_state, null);
     }
     updateGameStatus(`对局结束：${text}`);
     addBattleLogEntry(`对局结束：${text}`, 'system');
@@ -842,6 +955,7 @@ function setNetworkStatus(text, kind) {
 }
 
 function handleNetworkRetry(data) {
+    if (!acceptLive(data)) return;
     const message = (data && data.message) ? data.message : '网络问题，正在重连';
     gameState.isPlaying = true;
     gameState.isPaused = false;
@@ -853,6 +967,7 @@ function handleNetworkRetry(data) {
 }
 
 function handleBattlePaused(data) {
+    if (!acceptLive(data)) return;
     gameState.isPlaying = false;
     gameState.isPaused = true;
     gameState.canRetryNow = false;
@@ -867,11 +982,21 @@ function handleBattlePaused(data) {
 function applyBattleState(state) {
     if (!state) return;
     // 丢弃过期快照（比已经收到的新状态更早），避免按钮被旧状态覆盖
-    if (state.red_player && state.black_player) {
+    if (!acceptLive(state) && state.status !== 'no_battle') return;
+    if (state.match_label) {
+        document.getElementById('active-match').textContent = state.match_label;
+    } else if (state.red_player && state.black_player) {
         document.getElementById('active-match').textContent = `红：${state.red_player.display_name} · 黑：${state.black_player.display_name}`;
     }
     if (state.battle_id) {
-        if (gameState.battleId === state.battle_id && typeof state.seq === 'number' && state.seq < (gameState.lastSeq || 0)) {
+        const switched = gameState.battleId && gameState.battleId !== 'none' && gameState.battleId !== state.battle_id;
+        if (switched) {
+            gameState.lastSeq = 0;
+            gameState.restoredLog = false;
+            gameState.boardState = null;
+            gameState.mountedGame = null;
+        }
+        if (!switched && gameState.battleId === state.battle_id && typeof state.seq === 'number' && state.seq < (gameState.lastSeq || 0)) {
             return;
         }
         // 刚点了停止：停止请求发出前的「进行中」快照不再采用
@@ -894,9 +1019,23 @@ function applyBattleState(state) {
         }
         return;
     }
-    if (state.board_state && state.board_state !== gameState.boardState) {
-        boardRenderer.updateBoard(state.board_state);
-        if (state.last_move) boardRenderer.setLastMove(state.last_move);
+    if (state.game) gameState.game = state.game;
+    if (state.mode) gameState.mode = state.mode;
+    if (state.rules) {
+        const note = document.getElementById('board-note');
+        if (note) note.textContent = state.rules;
+    }
+    if (state.side_labels) gameState.sideLabels = state.side_labels;
+    gameState.yourTurn = !!state.your_turn;
+    gameState.legalMoves = state.your_turn ? (state.legal_moves || []) : [];
+    if (!state.your_turn && state.game !== 'gomoku' && window.boardRenderer && window.boardRenderer.setHints) {
+        window.boardRenderer.setHints(null, []);
+        gameState.selected = null;
+    }
+    updateThinkingVisibility();
+    updateClickHint();
+    if (state.board_state && (state.board_state !== gameState.boardState || gameState.mountedGame !== state.game)) {
+        paintBoard(state.game || 'xiangqi', state.board_state, state.last_move);
         gameState.boardState = state.board_state;
     }
     if (state.current_player) {
@@ -953,9 +1092,14 @@ function applyBattleState(state) {
         setNetworkStatus(state.phase_message || '网络问题，正在重连', 'is-retrying');
         updateGameStatus('网络重连中');
     } else if (phase === 'thinking') {
-        const side = state.current_player === 'red' ? '红方' : '黑方';
-        updateGameStatus(`等待${side}模型回复（${Math.round(waited)} 秒）${state.in_check ? '，正被将军' : ''}`);
+        const side = sideLabel(state.current_player);
+        const hidden = state.mode === 'human_vs_ai' ? '。思考内容要等这步落下后才能展开' : '';
+        const retrying = state.phase_message && /截断|正文是空的|输出上限/.test(state.phase_message);
+        updateGameStatus(retrying ? state.phase_message : `等待${side}模型回复（${Math.round(waited)} 秒）${state.in_check ? '，正被将军' : ''}${hidden}`);
         if (!gameState.canRetryNow) setNetworkStatus('', '');
+    } else if (phase === 'human_turn') {
+        updateGameStatus(`轮到${sideLabel(state.current_player)}，请点击棋盘`);
+        setNetworkStatus('', '');
     } else {
         updateGameStatus('对战进行中');
     }
@@ -1030,7 +1174,9 @@ function updateControlButtons(isPlaying) {
     APIProfiles.lock(isPlaying || !!gameState.isPaused);
     const paused = !!gameState.isPaused;
     const retry = !!gameState.canRetryNow && !!isPlaying;
-    document.getElementById('start-battle').disabled = isPlaying || paused;
+    const startBtn = document.getElementById('start-battle');
+    startBtn.disabled = false;
+    startBtn.textContent = (isPlaying || paused) ? '开始新局' : '开始对战';
     document.getElementById('stop-battle').disabled = !isPlaying && !paused;
     const resumeBtn = document.getElementById('resume-battle');
     if (resumeBtn) {
@@ -1279,6 +1425,261 @@ function formatDuration(milliseconds) {
     const remainingSeconds = seconds % 60;
     
     return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+}
+
+function acceptLive(data) {
+    if (!data || typeof data !== 'object') return true;
+    if (gameState.ignoreEvents) return false;
+    if (!data.battle_id) return gameState.battleId !== 'none';
+    if (!gameState.battleId) return true;
+    if (gameState.battleId === 'none') return false;
+    return data.battle_id === gameState.battleId;
+}
+
+function readSetup() {
+    const game = (document.getElementById('game-select') || {}).value || 'xiangqi';
+    const mode = (document.getElementById('mode-select') || {}).value || 'ai_vs_ai';
+    const picked = document.querySelector('input[name="human-side"]:checked');
+    return {game, mode, humanSide: picked ? picked.value : 'first'};
+}
+
+function buildStartPayload(setup) {
+    const payload = {game: setup.game, mode: setup.mode, human_side: setup.humanSide};
+    if (setup.mode === 'local_pvp') return payload;
+    const firstKey = setup.game === 'gomoku' ? 'black_player' : 'red_player';
+    const secondKey = setup.game === 'gomoku' ? 'white_player' : 'black_player';
+    if (setup.mode === 'ai_vs_ai' || setup.humanSide === 'second') payload[firstKey] = getPlayerConfig('red');
+    if (setup.mode === 'ai_vs_ai' || setup.humanSide === 'first') payload[secondKey] = getPlayerConfig('black');
+    return payload;
+}
+
+function setActionError(text) {
+    const el = document.getElementById('action-error');
+    if (el) el.textContent = text || '';
+}
+
+function paintBoard(game, boardState, lastMove) {
+    const box = document.querySelector('.board-container');
+    if (game === 'gomoku' && window.GomokuBoardRenderer) {
+        const canvas = document.getElementById('chess-board');
+        if (!window.gomokuRenderer) window.gomokuRenderer = new window.GomokuBoardRenderer(canvas);
+        if (gameState.mountedGame !== 'gomoku') window.gomokuRenderer.mount();
+        window.gomokuRenderer.updateBoard(boardState);
+        if (lastMove) window.gomokuRenderer.setLastMove(lastMove);
+        if (box) { box.classList.add('gomoku'); box.classList.remove('xiangqi'); }
+        gameState.mountedGame = 'gomoku';
+        return;
+    }
+    if (window.boardRenderer) {
+        if (gameState.mountedGame !== 'xiangqi' && window.boardRenderer.mount) window.boardRenderer.mount();
+        window.boardRenderer.updateBoard(boardState);
+        if (lastMove) window.boardRenderer.setLastMove(lastMove);
+        if (box) { box.classList.add('xiangqi'); box.classList.remove('gomoku'); }
+        gameState.mountedGame = 'xiangqi';
+    }
+}
+
+function showIdleBoard(game) {
+    const box = document.querySelector('.board-container');
+    if (game === 'gomoku' && window.GomokuBoardRenderer) {
+        const canvas = document.getElementById('chess-board');
+        if (!window.gomokuRenderer) window.gomokuRenderer = new window.GomokuBoardRenderer(canvas);
+        window.gomokuRenderer.lastMove = null;
+        window.gomokuRenderer.mount();
+        if (box) { box.classList.add('gomoku'); box.classList.remove('xiangqi'); }
+        gameState.mountedGame = 'gomoku';
+        return;
+    }
+    if (window.boardRenderer) {
+        window.boardRenderer.lastMove = null;
+        window.boardRenderer.hints = {selected: null, targets: []};
+        if (window.boardRenderer.mount) window.boardRenderer.mount();
+        else window.boardRenderer.showInitialPosition();
+        if (box) { box.classList.add('xiangqi'); box.classList.remove('gomoku'); }
+        gameState.mountedGame = 'xiangqi';
+    }
+}
+
+function updateThinkingVisibility() {
+    const gomoku = gameState.game === 'gomoku';
+    document.querySelectorAll('.think-box').forEach((box) => {
+        const side = box.getAttribute('data-think');
+        const show = gomoku ? (side === 'black' || side === 'white') : (side === 'red' || side === 'black');
+        box.classList.toggle('hidden', !show);
+    });
+    const names = gomoku
+        ? {black: '黑棋', white: '白棋'}
+        : {red: '红方', black: '黑方'};
+    Object.keys(names).forEach((side) => {
+        const title = document.getElementById(`think-title-${side}`);
+        if (!title) return;
+        title.textContent = gameState.mode === 'human_vs_ai'
+            ? `${names[side]} · 思考（落子后才能展开）`
+            : `${names[side]} · 模型思考与分析`;
+    });
+}
+
+function updateClickHint() {
+    const el = document.getElementById('click-hint');
+    const canvas = document.getElementById('chess-board');
+    if (!el) return;
+    const playing = gameState.isPlaying || gameState.isPaused;
+    if (!playing) {
+        el.textContent = '人机或同机双人时，轮到你就直接点棋盘。AI 对 AI 不用点。';
+        if (canvas) canvas.classList.remove('can-click');
+        return;
+    }
+    if (gameState.yourTurn) {
+        el.textContent = gameState.game === 'gomoku'
+            ? '轮到你了：点一个空的交叉点落子。'
+            : '轮到你了：先点自己的棋子，再点标出的位置。';
+        if (canvas) canvas.classList.add('can-click');
+        return;
+    }
+    el.textContent = gameState.mode === 'ai_vs_ai'
+        ? '两边都由模型下，不用点击棋盘。'
+        : '现在还不能走。AI 思考时点棋盘不会落子。';
+    if (canvas) canvas.classList.remove('can-click');
+}
+
+function refreshSetupCopy() {
+    const setup = readSetup();
+    const redLegend = document.querySelector('.player-red legend');
+    const blackLegend = document.querySelector('.player-black legend');
+    if (redLegend) redLegend.textContent = setup.game === 'gomoku' ? '黑棋（先手）' : '红方（先手）';
+    if (blackLegend) blackLegend.textContent = setup.game === 'gomoku' ? '白棋（后手）' : '黑方（后手）';
+    const humanFirst = setup.humanSide !== 'second';
+    const showFirst = setup.mode === 'ai_vs_ai' || (setup.mode === 'human_vs_ai' && !humanFirst);
+    const showSecond = setup.mode === 'ai_vs_ai' || (setup.mode === 'human_vs_ai' && humanFirst);
+    const redBox = document.querySelector('.player-red');
+    const blackBox = document.querySelector('.player-black');
+    if (redBox) redBox.classList.toggle('hidden', !showFirst);
+    if (blackBox) blackBox.classList.toggle('hidden', !showSecond);
+    const sideRow = document.getElementById('human-side-row');
+    const localNote = document.getElementById('local-mode-note');
+    if (sideRow) sideRow.classList.toggle('hidden', setup.mode !== 'human_vs_ai');
+    if (localNote) localNote.classList.toggle('hidden', setup.mode !== 'local_pvp');
+    const sideHint = document.getElementById('side-hint');
+    const rules = document.getElementById('rules-hint');
+    const note = document.getElementById('board-note');
+    if (setup.game === 'gomoku') {
+        if (sideHint) sideHint.textContent = '五子棋先手是黑棋，后手是白棋。人机只填 AI 那一侧。';
+        if (rules) rules.textContent = '15×15 自由规则：没有禁手。横、竖、斜连成五子或更多就赢；棋盘下满仍没有五连就是和棋。这不是职业连珠。';
+        if (note && !gameState.isPlaying) note.textContent = '五子棋 · 无禁手 · 五连或以上获胜 · 棋谱会写明游戏和双方';
+    } else {
+        if (sideHint) sideHint.textContent = '中国象棋先手是红方，后手是黑方。人机只填 AI 那一侧。';
+        if (rules) rules.textContent = '将死、困毙判负。默认双方合计 300 步未分胜负则和棋。长将、长捉还没做，不是完整竞赛规则。';
+        if (note && !gameState.isPlaying) note.textContent = '将死、困毙判负 · 默认 300 步判和 · 每步自动保存到 games/';
+    }
+    const assignFirst = document.getElementById('assign-red');
+    const assignSecond = document.getElementById('assign-black');
+    if (assignFirst) assignFirst.textContent = setup.game === 'gomoku' ? '保存并选给黑棋（先手）' : '保存并选给红方';
+    if (assignSecond) assignSecond.textContent = setup.game === 'gomoku' ? '保存并选给白棋（后手）' : '保存并选给黑方';
+    const idle = !gameState.isPlaying && !gameState.isPaused && (!gameState.battleId || gameState.battleId === 'none');
+    if (idle && gameState.mountedGame !== setup.game) showIdleBoard(setup.game);
+    updateClickHint();
+}
+
+function bindPlatformControls() {
+    ['game-select', 'mode-select'].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', () => {
+            refreshSetupCopy();
+            if (gameState.isPlaying || gameState.isPaused) {
+                setActionError('选项只决定下一局。当前棋盘不变；要换游戏或方式，请点「开始新局」并确认。');
+            }
+        });
+    });
+    document.querySelectorAll('input[name="human-side"]').forEach((el) => {
+        el.addEventListener('change', refreshSetupCopy);
+    });
+    refreshSetupCopy();
+    updateThinkingVisibility();
+}
+
+function onBoardClick(ev) {
+    const game = gameState.mountedGame || gameState.game;
+    const renderer = game === 'gomoku' ? window.gomokuRenderer : window.boardRenderer;
+    if (!renderer || !renderer.cellFromEvent) return;
+    const cell = renderer.cellFromEvent(ev);
+    if (!cell) return;
+    if (!gameState.yourTurn || !gameState.battleId || gameState.battleId === 'none') {
+        setActionError(gameState.isPlaying ? '现在不能走棋。AI 思考或对方回合时，点棋盘不会落子。' : '还没开始，或现在不是你走棋。');
+        return;
+    }
+    if (game === 'gomoku') {
+        submitHumanMove(cell.move);
+        return;
+    }
+    const legal = gameState.legalMoves || [];
+    const coord = cell.coord;
+    if (!gameState.selected) {
+        const fromHere = legal.filter((move) => move.startsWith(coord) && move.length === 4);
+        if (!fromHere.length) {
+            setActionError('这里没有你能走的棋子。请点自己的棋子。');
+            return;
+        }
+        gameState.selected = coord;
+        window.boardRenderer.setHints(coord, fromHere.map((move) => move.slice(2)));
+        setActionError('');
+        return;
+    }
+    if (gameState.selected === coord) {
+        gameState.selected = null;
+        window.boardRenderer.setHints(null, []);
+        return;
+    }
+    const move = gameState.selected + coord;
+    if (!legal.includes(move)) {
+        const fromHere = legal.filter((item) => item.startsWith(coord) && item.length === 4);
+        if (fromHere.length) {
+            gameState.selected = coord;
+            window.boardRenderer.setHints(coord, fromHere.map((item) => item.slice(2)));
+            setActionError('');
+            return;
+        }
+        setActionError('这一步不合法。绿色位置才是现在可以走的地方。');
+        return;
+    }
+    submitHumanMove(move);
+}
+
+function submitHumanMove(move) {
+    const battleId = gameState.battleId;
+    setActionError('正在提交…');
+    fetch('/api/human_move', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({battle_id: battleId, move})
+    })
+    .then((response) => response.json().then((data) => ({ok: response.ok, data})))
+    .then(({ok, data}) => {
+        if (gameState.battleId !== battleId) return;
+        if (!ok || !data || data.status !== 'success') {
+            setActionError((data && data.message) || '这一步没有被接受');
+            return;
+        }
+        setActionError('');
+        gameState.selected = null;
+        if (window.boardRenderer && window.boardRenderer.setHints) window.boardRenderer.setHints(null, []);
+    })
+    .catch(() => setActionError('连不上本地服务，这一步没有送出。请看终端里的程序是否还在运行。'));
+}
+
+function showSealedThinking(player, move, thinking, analysis, strategy) {
+    const box = document.getElementById(`${player}-thinking-process`);
+    if (!box) return;
+    if (box.textContent && box.textContent.indexOf('等待') >= 0) box.textContent = '';
+    const details = document.createElement('details');
+    details.className = 'sealed-thinking';
+    const summary = document.createElement('summary');
+    summary.textContent = `查看 ${move} 这一步的思考（默认折叠，落子后才能看）`;
+    const body = document.createElement('div');
+    const text = [thinking, analysis, strategy].filter(Boolean).join('\n');
+    body.textContent = text || '这一步没有返回可展示的思考文字。';
+    details.appendChild(summary);
+    details.appendChild(body);
+    box.appendChild(details);
 }
 
 function showLoading(show) {

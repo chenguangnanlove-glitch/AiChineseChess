@@ -1,0 +1,21 @@
+这次是覆盖更新，不用重装。
+
+项目文件夹：/Users/nan/Downloads/AiChineseChess-multi-game-src
+里面已有 Python 3.12 的 .venv 和 games。这两样都留着。
+
+1. 如果程序还在跑，到那个终端按 Ctrl + C，等它停掉。
+2. 把新的 zip 解压，用里面的文件盖住该文件夹里的同名文件。
+   不要删除 .venv。
+   不要删除 games。
+   不要再运行 python3 -m venv，也不要在家目录另建一个 .venv。
+3. 打开终端，输入：
+
+cd /Users/nan/Downloads/AiChineseChess-multi-game-src
+source .venv/bin/activate
+python app.py
+
+4. 浏览器打开 http://localhost:5003 ，按 Command + Shift + R。
+
+一般不需要 pip install。只有启动时明确说缺少某个库，才在已经 activate 的终端里执行 pip install -r requirements.txt。
+
+打开页面后，如果以前保存的 DeepSeek 或 Kimi 输出上限太低，页面会自动调高，并写一行说明。API key 仍要重新输入。不需要换模型。

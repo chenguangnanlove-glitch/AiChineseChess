@@ -4,15 +4,29 @@ from .chess_game import ChessGame
 from .llm_player import LLMPlayer
 
 class ChessBattle:
-    """象棋对战管理类"""
+    """对局容器。中国象棋沿用红/黑；五子棋用 players 里的黑/白。"""
     
-    def __init__(self, red_player: LLMPlayer, black_player: LLMPlayer):
-        self.game = ChessGame()
+    def __init__(self, red_player: LLMPlayer, black_player: LLMPlayer, game=None, mode: str = "ai_vs_ai",
+                 players: Optional[dict] = None, game_type: str = None):
+        self.game = game if game is not None else ChessGame()
+        self.mode = mode
+        self.game_type = game_type or getattr(self.game, "game_type", "xiangqi")
+        self.players = players or {"red": red_player, "black": black_player}
         self.red_player = red_player
         self.black_player = black_player
         self.battle_log = []
         self.start_time = time.time()
         self.status = "waiting"  # waiting, playing, finished, error
+
+    def player_for(self, color: str):
+        if color in self.players:
+            return self.players[color]
+        if color == "red":
+            return self.red_player
+        return self.black_player
+
+    def iter_players(self):
+        return list(self.players.values())
         
     def start_battle(self) -> Dict:
         """开始对战（同步版本，用于测试）"""
@@ -95,7 +109,7 @@ class ChessBattle:
             'board_state': self.game.get_board_state(),
             'move_count': len(self.game.move_history),
             'timestamp': time.time(),
-            'evaluation': self.game.get_position_evaluation()
+            'evaluation': self.game.get_position_evaluation() if hasattr(self.game, "get_position_evaluation") else None,
         }
         
         self.battle_log.append(log_entry)
@@ -112,20 +126,20 @@ class ChessBattle:
                 'reason': 'ongoing',
             }
         color = st["winner"]
-        if color == "red":
-            winner = self.red_player.display_name
-            game_result = "红方获胜"
-        elif color == "black":
-            winner = self.black_player.display_name
-            game_result = "黑方获胜"
+        if color and self.player_for(color) is not None:
+            winner = self.player_for(color).display_name
+            label = self.game.side_label(color) if hasattr(self.game, "side_label") else color
+            game_result = f"{label}获胜"
         else:
             winner = None
-            game_result = "平局"
+            game_result = "平局" if self.game_type == "xiangqi" else "和棋"
         reason_cn = {
             'checkmate': '将死',
             'stalemate': '困毙',
             'king_captured': '吃将',
             'move_limit': '步数上限判和',
+            'five': '五连或以上',
+            'full': '满盘和棋',
         }.get(st["reason"], st["reason"])
         message = st["message"] + (f"（{winner}）" if winner else "")
         return {

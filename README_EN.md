@@ -1,6 +1,6 @@
 # AI Chinese Chess (弈台)
 
-A browser-based Chinese chess arena where large language models play each other in real time and show their thinking.
+A local browser arena for Chinese chess and free-rule Gomoku. Each game can be human vs AI, AI vs AI, or two people on the same computer. The Chinese README is the full guide, including macOS Monterey and Windows setup.
 
 This repository is a derivative of [zstar1003/AiChineseChess](https://github.com/zstar1003/AiChineseChess). **The upstream repository currently has no LICENSE file**, and the copyright remains with the original author. Forking the project and keeping attribution does not grant a full open-source license or a right to relicense it. A fork by itself is not a compliant open-source release. This repository does not add an MIT license or any other license. Adding one requires permission from the original author.
 
@@ -12,12 +12,13 @@ This repository is a derivative of [zstar1003/AiChineseChess](https://github.com
   </h4>
 </div>
 
-The Chinese README is the complete guide. In short, this fork adds:
+The Chinese README is the complete guide. In short, this fork adds a second game and three match modes on top of the earlier API work:
 
 - Code paths for DeepSeek, Kimi, Gemini (OpenAI-compatible endpoint), **native Anthropic Claude Messages API**, other OpenAI-compatible gateways, and **local models such as Ollama / LM Studio** (API key may be left empty on `localhost` / `127.0.0.1` / `::1`). Automated tests use a local mock server only. **They do not show that every compatible provider has been tested against a live paid API.**
 - Automatic retry when a server rejects `max_tokens` in favor of `max_completion_tokens`, or rejects streaming / returns plain JSON
 - Check, a requirement to answer check, checkmate, stalemate (困毙), and a default 300-move draw limit. Perpetual check (长将) and perpetual chase (长捉) have not been verified, so this is not a complete competition-rule implementation. Also includes disconnect resume, per-move game records, and a small-screen layout
 - API keys stay in page memory only (never written to localStorage or disk)
+- Gomoku is 15×15 with free rules: no forbidden moves, five or more in a row wins, a full board without that is a draw. This is not professional Renju.
 
 `static/js/socket.io.min.js` is the third-party Socket.IO client 4.0.1. Its own file header remains under the MIT License and covers only that file. It does not license this repository as MIT.
 

@@ -40,6 +40,7 @@ class LLMPlayer:
         self.api_key = api_key
         self.base_url = base_url
         self.display_name = display_name or model_name
+        self.kind = "ai"
         self.move_count = 0
         self.total_thinking_time = 0
         self.socketio = socketio
@@ -80,10 +81,20 @@ class LLMPlayer:
         return token is self._active_token
 
     def _emit(self, event, payload):
+        if event == "thinking_stream" and getattr(self._tls, "suppress_stream", False):
+            return
+        allowed = getattr(self, "emit_allowed", None)
+        if callable(allowed) and not allowed():
+            return
         if self.socketio and self._call_active():
+            if isinstance(payload, dict):
+                payload = dict(payload)
+                battle_id = getattr(self, "battle_id", None)
+                if battle_id:
+                    payload.setdefault("battle_id", battle_id)
             self.socketio.emit(event, payload)
     
-    def get_move(self, board_state: str, move_history: List[dict], legal_moves: List[str] = None, retry_hint: str = None, strict_output: bool = False, in_check: bool = False, checkers: List[str] = None) -> Optional[Dict]:
+    def get_move(self, board_state: str, move_history: List[dict], legal_moves: List[str] = None, retry_hint: str = None, strict_output: bool = False, in_check: bool = False, checkers: List[str] = None, player_color: str = None, rules=None, stream_thinking: bool = True, output_budget=None) -> Optional[Dict]:
         """获取模型的下一步棋（支持流式输出）
         
         Args:
@@ -96,18 +107,33 @@ class LLMPlayer:
             Dict: 包含棋步和思考过程的字典
         """
         start_time = time.time()
+        self._tls.suppress_stream = not stream_thinking
+        saved_budget = None
+        if output_budget is not None:
+            saved_budget = self.api_config.get('max_output')
+            self.api_config['max_output'] = int(output_budget)
+            self.max_output = int(output_budget)
         
         try:
-            # 构建提示词
-            prompt = self.build_chess_prompt(board_state, move_history, legal_moves, retry_hint=retry_hint, strict_output=strict_output, in_check=in_check, checkers=checkers)
+            # 构建提示词。五子棋使用自己的棋盘说明和「落子」格式，不走象棋坐标。
+            if rules is not None and hasattr(rules, "build_prompt"):
+                prompt = rules.build_prompt(
+                    board_state, move_history, legal_moves,
+                    retry_hint=retry_hint, strict_output=strict_output,
+                )
+                system_prompt = rules.system_prompt() if hasattr(rules, "system_prompt") else None
+            else:
+                prompt = self.build_chess_prompt(board_state, move_history, legal_moves, retry_hint=retry_hint, strict_output=strict_output, in_check=in_check, checkers=checkers)
+                system_prompt = None
             
             # 确定玩家颜色
-            player_color = "red" if len(move_history) % 2 == 0 else "black"
+            if not player_color:
+                player_color = "red" if len(move_history) % 2 == 0 else "black"
             
             print(f"开始获取 {self.display_name} 的棋步...")
             
             # OpenAI 兼容与 Anthropic 原生都走统一请求入口（含自动兼容重试）。
-            api_result = self._call_openai_compatible_stream(prompt, player_color)
+            api_result = self._call_openai_compatible_stream(prompt, player_color, system_prompt=system_prompt)
 
             if isinstance(api_result, str):
                 api_result = {'content': api_result, 'reasoning': ''}
@@ -131,24 +157,35 @@ class LLMPlayer:
             content = clean_text(api_result.get('content'), self.api_key)
             reasoning = clean_text(api_result.get('reasoning'), self.api_key)
             print(f"API调用完成，content长度: {len(content)}，reasoning长度: {len(reasoning)}，finish_reason={api_result.get('finish_reason')}")
+            finish_reason = api_result.get('finish_reason')
             if not content.strip():
-                reason = "模型正文content为空"
-                if api_result.get('finish_reason') == 'length':
-                    reason += "（finish_reason=length，可能在思考阶段就用尽了token上限）"
+                # 正文为空时不从 reasoning 里猜着法。length / max_tokens 是输出被截断，不是走法不合法。
+                if finish_reason in ("length", "max_tokens"):
+                    error_type = "truncated"
+                    reason = "模型正文是空的，回答在写出最终着法前被输出上限截断（finish_reason=%s）" % finish_reason
                 elif reasoning.strip():
-                    reason += "（只有reasoning_content，没有最终回答）"
+                    error_type = "reasoning_only"
+                    reason = "模型已结束，但正文是空的，只有思考内容"
+                else:
+                    error_type = "parse"
+                    reason = "模型正文是空的"
                 print(f"{self.display_name} {reason}")
                 return {
                     'move': None,
                     'error': reason,
-                    'error_type': 'parse',
+                    'error_type': error_type,
+                    'finish_reason': finish_reason,
                     'thinking': reasoning,
                     'raw_response': content,
                     'player': self.display_name,
                 }
 
-            # 只根据最终 content 提取走法，不用推理过程里出现的坐标
-            move_info = self.parse_response(content, legal_moves=legal_moves)
+            # 只根据最终 content 提取走法，不用推理过程里出现的坐标。
+            # 五子棋只走自己的解析器，避免把象棋四字坐标套过来。
+            if rules is not None and hasattr(rules, "parse_model_response"):
+                move_info = rules.parse_model_response(content, legal_moves=legal_moves)
+            else:
+                move_info = self.parse_response(content, legal_moves=legal_moves)
 
             thinking_time = time.time() - start_time
             self.total_thinking_time += thinking_time
@@ -163,10 +200,22 @@ class LLMPlayer:
                 return move_info
 
             print(f"{self.display_name} 无法从content中解析出棋步。失败原因：未匹配到坐标格式或合法走法")
+            # 正文被长度截断、里面还没有完整着法：同样按截断处理，仍不读 reasoning。
+            if finish_reason in ("length", "max_tokens"):
+                return {
+                    'move': None,
+                    'error': '回答被输出上限截断，正文里还没有完整着法（finish_reason=%s）' % finish_reason,
+                    'error_type': 'truncated',
+                    'finish_reason': finish_reason,
+                    'thinking': reasoning,
+                    'raw_response': content,
+                    'player': self.display_name,
+                }
             return {
                 'move': None,
-                'error': '无法从模型回复中解析出棋步（正文已收到，但没有可识别的坐标）',
+                'error': '模型有回复，但里面没有可识别的着法',
                 'error_type': 'parse',
+                'finish_reason': finish_reason,
                 'thinking': reasoning,
                 'raw_response': content,
                 'player': self.display_name,
@@ -187,6 +236,11 @@ class LLMPlayer:
                 'fatal': False,
                 'player': self.display_name,
             }
+        finally:
+            self._tls.suppress_stream = False
+            if saved_budget is not None:
+                self.api_config['max_output'] = saved_budget
+                self.max_output = saved_budget
     
     def _live_config(self):
         """用实例上当前的 base_url / api_key（测试或恢复对局可能已改写）。"""

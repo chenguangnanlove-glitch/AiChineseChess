@@ -2,11 +2,11 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>弈台 · AI 中国象棋</title>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css', v='opensource-1') }}">
+<title>弈台 · 中国象棋与五子棋</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css', v='platform-1') }}">
 </head>
 <body>
-<header class="app-header"><div><strong>弈台 <span>AI 中国象棋</span></strong><p>配置你的模型，让它们在棋盘上见真章。</p></div><a href="#api-manager">API 配置管理 ↓</a></header>
+<header class="app-header"><div><strong>弈台 <span>中国象棋 / 五子棋</span></strong><p>人机、AI 对 AI，或两个人在这台电脑上轮流下。</p></div><a href="#api-manager">API 配置管理 ↓</a></header>
 <section class="battle-toolbar" aria-label="对战控制">
  <div class="control-buttons">
   <button id="start-battle" class="btn btn-primary">开始对战</button>
@@ -20,8 +20,30 @@
 <main class="container">
  <div class="main-content">
   <aside class="control-panel">
-   <details class="panel" open><summary>对局配置 <small>仅影响下一局</small></summary>
-    <div class="panel-body"><p class="hint">两边都能使用任意已存配置（含 Claude 官方接口和本机 Ollama）。对局中锁定；停止后可改。云端 API 刷新后请重新输入 key；本机地址可留空。后端仍在运行的对局可直接继续。</p>
+   <details class="panel" open><summary>对局配置 <small>只影响下一局</small></summary>
+    <div class="panel-body">
+     <fieldset class="player-config" id="match-setup"><legend>这一局怎么下</legend>
+      <label for="game-select">游戏</label>
+      <select id="game-select">
+       <option value="xiangqi">中国象棋</option>
+       <option value="gomoku">五子棋（15×15 自由规则，无禁手）</option>
+      </select>
+      <label for="mode-select">对局方式</label>
+      <select id="mode-select">
+       <option value="human_vs_ai">人机对战</option>
+       <option value="ai_vs_ai">AI 对 AI</option>
+       <option value="local_pvp">同机双人</option>
+      </select>
+      <div id="human-side-row" class="choice-row">
+       <label><input type="radio" name="human-side" value="first" checked> 我先手</label>
+       <label><input type="radio" name="human-side" value="second"> 我后手</label>
+      </div>
+      <p id="side-hint" class="hint">中国象棋先手是红方，后手是黑方。</p>
+      <p id="rules-hint" class="hint">将死、困毙判负。默认双方合计 300 步未分胜负则和棋。长将、长捉还没做，不是完整竞赛规则。</p>
+      <p id="local-mode-note" class="hint hidden">同机双人不用 API key，也不会去访问模型。两个人轮流在这块棋盘上点击即可。</p>
+      <p id="next-game-note" class="hint">进行中改游戏或方式，不会改当前棋盘。要换，请点「开始新局」，确认后才会停掉这一盘并清空。</p>
+     </fieldset>
+     <p class="hint">云端模型要填 API key，只放在这个页面的内存里，刷新后要重新输入。本机 Ollama / LM Studio 可以留空。人机只填 AI 那一方；AI 对 AI 两边分开填。</p>
      {% for side, label in [('red','红'), ('black','黑')] %}
      <fieldset class="player-config player-{{ side }}"><legend>{{ label }}方</legend>
       <label for="{{ side }}-model">API / 模型配置</label><select id="{{ side }}-model" class="model-select" data-setup></select>
@@ -37,15 +59,17 @@
    </details>
   </aside>
   <section class="chess-board-section panel" aria-label="棋盘">
-   <div class="current-player-info"><div id="current-player-text">当前轮到红方执棋</div><div id="active-match" class="hint">等待模型就位</div></div>
-   <div class="board-container"><canvas id="chess-board" width="600" height="660" aria-label="中国象棋棋盘"></canvas></div>
+   <div class="current-player-info"><div id="current-player-text">当前轮到红方执棋</div><div id="active-match" class="hint">还没有开始</div><div id="click-hint" class="hint">人机或双人时，轮到你就直接点棋盘。</div></div>
+   <div class="board-container xiangqi"><canvas id="chess-board" width="600" height="660" aria-label="棋盘"></canvas></div>
+   <p id="action-error" class="action-error" role="alert"></p>
    <div class="stats"><span>第 <b id="current-round">0</b> 回合</span><span>总步数 <b id="total-moves">0</b></span><span>用时 <b id="battle-duration">00:00</b></span></div>
-   <p class="board-note">将死、困毙判负 · 默认 300 步判和 · 每步自动保存到 games/</p>
+   <p id="board-note" class="board-note">将死、困毙判负 · 默认 300 步判和 · 每步自动保存到 games/</p>
   </section>
   <aside class="info-panel">
    <details class="panel" open><summary>对战日志 <small>可展开长错误</small></summary><div class="panel-body"><button id="expand-log" class="btn">展开全部日志</button><div id="battle-log" class="battle-log" tabindex="0"><p>等待对战开始…</p></div></div></details>
-   <details class="panel"><summary>红方 · 模型思考与分析</summary><div id="red-thinking-process" class="thinking-content" tabindex="0">等待红方开始思考…</div></details>
-   <details class="panel"><summary>黑方 · 模型思考与分析</summary><div id="black-thinking-process" class="thinking-content" tabindex="0">等待黑方开始思考…</div></details>
+   <details class="panel think-box" data-think="red"><summary id="think-title-red">红方 · 模型思考与分析</summary><div id="red-thinking-process" class="thinking-content" tabindex="0">等待红方开始思考…</div></details>
+   <details class="panel think-box" data-think="black"><summary id="think-title-black">黑方 · 模型思考与分析</summary><div id="black-thinking-process" class="thinking-content" tabindex="0">等待黑方开始思考…</div></details>
+   <details class="panel think-box hidden" data-think="white"><summary id="think-title-white">白棋 · 模型思考与分析</summary><div id="white-thinking-process" class="thinking-content" tabindex="0">等待白棋开始思考…</div></details>
   </aside>
  </div>
  <section id="api-manager" class="panel api-manager">
@@ -72,6 +96,7 @@
 </main>
 <div id="loading-overlay" role="status" style="display:none">正在启动对局…</div>
 <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
-<script src="{{ url_for('static', filename='js/profiles.js', v='opensource-1') }}"></script>
-<script src="{{ url_for('static', filename='js/chess.js', v='opensource-1') }}"></script>
+<script src="{{ url_for('static', filename='js/gomoku_board.js', v='platform-4') }}"></script>
+<script src="{{ url_for('static', filename='js/profiles.js', v='platform-4') }}"></script>
+<script src="{{ url_for('static', filename='js/chess.js', v='platform-4') }}"></script>
 </body></html>

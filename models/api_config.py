@@ -131,7 +131,15 @@ def validate_config(raw, require_key=True):
     allowed = ('disabled', 'low', 'high') if provider == 'deepseek' else (('low', 'high') if provider == 'kimi' else ('disabled',))
     if thinking not in allowed:
         raise ConfigError('此 provider 不支持该思考模式；自定义/Gemini/Anthropic 不发送思考参数，Kimi 仅支持低/高')
-    default_max = 16384 if provider == 'kimi' else (4096 if provider == 'anthropic' or (provider == 'deepseek' and thinking != 'disabled') else 1024)
+    # DeepSeek 的 max_tokens 含思考。1024 在 V4 上会出现 finish_reason=length 且正文为空。
+    if provider == 'kimi':
+        default_max = 16384
+    elif provider == 'anthropic':
+        default_max = 4096
+    elif provider == 'deepseek':
+        default_max = 8192 if thinking != 'disabled' else 4096
+    else:
+        default_max = 1024
     default_timeout = 90 if provider in ('deepseek', 'kimi') else 180
     return {
         'provider': provider, 'display_name': name.strip(), 'base_url': base,
